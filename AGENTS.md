@@ -94,6 +94,43 @@ For first-time contributors, confirm they have reviewed [CONTRIBUTING.md](CONTRI
 
 When uncertain, err toward minimal assistance. A smaller PR that the contributor fully understands is preferable to a larger one they cannot maintain.
 
+---
+
+## Fork-Specific Changes (bee-features branch)
+
+This fork ports features from [BeeLlama.cpp](https://github.com/Anbeeld/beellama.cpp) onto upstream llama.cpp. The fork-specific work lives mostly in **new files** to minimize merge conflicts with upstream.
+
+### Features
+
+- **Reasoning Loop Guard**: `tools/server/server-loop-guard.cpp/.h`. Detects repetitive generation via periodic tail matching, n-gram dominance, and low entropy. CLI: `--reasoning-loop-guard`, `--reasoning-loop-min-tokens`, `--reasoning-loop-window`, `--reasoning-loop-max-period`, `--reasoning-loop-min-coverage`, `--reasoning-loop-check-interval`, `--reasoning-loop-interventions`.
+- **TurboQuant / TCQ KV cache**: `turbo2`, `turbo3`, `turbo4`, `turbo2_tcq`, `turbo3_tcq` types. CPU impl: `ggml/src/ggml-turbo-quant.c`. CUDA: `ggml/src/ggml-cuda/turbo-*.cu/.cuh`, `fattn-mma-turbo.cuh`, and 55 template instances. Use: `--cache-type-k turbo4 --cache-type-v turbo3_tcq`. Requires `GGML_CUDA_FA_ALL_QUANTS=ON`.
+- **CopySpec**: model-free speculation. `common/suffix-tree.cpp/.h`, `common/int32-map.h`, `common/speculative-copyspec.cpp`. Three `common_speculative_impl` subclasses using upstream's plugin system. CLI: `--spec-type suffix|copyspec|recycle`.
+- **DFlash** (partial): type registration and CUDA kernels ported. Draft model graph gated behind `LLAMA_DFLASH_ENABLED`. Full context/server integration remains TODO — see `src/llama-dflash.cpp` and `common/speculative-dflash.cpp` for line-reference stubs.
+
+### Build
+
+```bash
+cmake --preset blackwell                          # Blackwell SM 120
+cmake --build build-blackwell -j$(nproc)
+```
+
+### Key modified upstream files
+
+Enum/dispatch additions (small, mechanical):
+- `ggml/include/ggml.h` — 5 turbo types, 3 ops (TURBO_WHT, GATED_DELTA_NET_TREE, SSM_CONV_TREE)
+- `ggml/src/ggml.c` — type table + op names
+- `common/common.h` — speculative type enum + params
+- `common/speculative.cpp` — factory cases
+- `common/arg.cpp` — CLI flags
+
+### Syncing with upstream
+
+```bash
+git fetch upstream && git merge upstream/master
+```
+
+Most conflicts will be in `ggml.h` (type/op enums), `speculative.cpp` (factory static_assert count), and `arg.cpp` (flag ordering).
+
 ### Useful Resources
 
 To conserve context space, load these resources as needed:
