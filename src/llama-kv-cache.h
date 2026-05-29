@@ -212,6 +212,11 @@ public:
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
+    void set_input_k_idxs_backend(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
+    void set_input_v_idxs_backend(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
+    void set_input_k_rot_backend(ggml_tensor * dst) const;
+    void set_input_v_rot_backend(ggml_tensor * dst) const;
+
 private:
     const llama_model & model;
     const llama_hparams & hparams;
@@ -388,6 +393,13 @@ public:
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
+
+    const llama_kv_cache * get_kv() const;
+    const llama_kv_cache::slot_info & current_sinfo() const;
+    void set_input_k_idxs_backend(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_v_idxs_backend(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_k_rot_backend(ggml_tensor * dst) const;
+    void set_input_v_rot_backend(ggml_tensor * dst) const;
 
 private:
     llama_memory_status status;

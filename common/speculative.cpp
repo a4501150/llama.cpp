@@ -13,9 +13,11 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstring>
 #include <iomanip>
 #include <map>
+#include <unordered_map>
 #include <cinttypes>
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
@@ -168,10 +170,29 @@ struct common_speculative_impl {
 
     // true if this implementation requires the target context to extract pre-norm embeddings
     virtual bool need_embd_pre_norm() const { return false; }
+
+    // DFlash-specific virtuals (default no-ops for non-DFlash impls)
+    virtual void set_seq_id(llama_seq_id /*seq_id*/) {}
+    virtual void set_prefill_capture_enabled(bool /*enabled*/) {}
+    virtual void discard_dflash_state(const char * /*reason*/) {}
+    virtual void note_prefill_suffix_scheduled() {}
+    virtual int  flush_prefill(int /*src_offset*/, int /*n_tokens*/) { return 0; }
+    virtual int  prepare_batch_draft(llama_context * /*ctx_dft*/) { return -1; }
+    virtual void update_logits(llama_context * /*ctx*/, const llama_tokens & /*batch_tokens*/, int /*n_accepted*/) {}
+    virtual void update_logits_by_indices(llama_context * /*ctx*/, const std::vector<int> & /*capture_indices*/) {}
+    virtual size_t ring_state_size() const { return 0; }
+    virtual bool ring_state_save(uint8_t * /*buf*/, size_t /*size*/) const { return false; }
+    virtual bool ring_state_load(const uint8_t * /*buf*/, size_t /*size*/) { return false; }
+    virtual common_dflash_ring_stats dflash_ring_stats() const { return {}; }
+    virtual void draft_tree(const common_params_speculative & /*params*/, const llama_tokens & /*prompt*/,
+                            llama_token /*id_last*/, int /*tree_budget*/, common_speculative_tree & /*tree*/) {}
 };
 
 // CopySpec / Suffix / Recycle implementations (defined in separate file for clarity)
 #include "speculative-copyspec.cpp"
+
+// DFlash cross-attention speculative decoding
+#include "speculative-dflash.cpp"
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
     common_params_speculative_draft params;
@@ -1393,7 +1414,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 LOG_WRN("%s: draft model is not specified - cannot use 'draft' type\n", __func__);
                 has_draft_simple = false;
             }
-        } else if (has_draft_model_path && !has_mtp && !has_draft_eagle3) {
+        } else if (has_draft_model_path && !has_mtp && !has_draft_eagle3 && !has_dflash) {
             LOG_WRN("%s: draft model is specified but 'draft' speculative type is not explicitly enabled - enabling it\n", __func__);
             has_draft_simple = true;
         }
@@ -1471,9 +1492,27 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_DFLASH: {
-                // TODO: implement common_speculative_impl_dflash
-                // Source: beellama.cpp/common/speculative.cpp lines 1653-3263
-                LOG_WRN("%s: DFlash speculative type is not yet implemented\n", __func__);
+                llama_context * dfl_ctx_tgt = params.draft.ctx_tgt;
+                llama_context * dfl_ctx_dft = params.draft.ctx_dft;
+                bool dfl_owns_dft = false;
+                if (!dfl_ctx_dft && params.model_dft) {
+                    dfl_ctx_dft = common_speculative_create_ctx_dft(params);
+                    dfl_owns_dft = true;
+                }
+                if (!dfl_ctx_tgt || !dfl_ctx_dft) {
+                    LOG_WRN("%s: DFlash requires ctx_tgt and ctx_dft\n", __func__);
+                    if (dfl_owns_dft && dfl_ctx_dft) llama_free(dfl_ctx_dft);
+                    break;
+                }
+                impls.push_back(std::make_unique<common_speculative_impl_dflash>(
+                    dfl_ctx_tgt, dfl_ctx_dft, params.model_dft,
+                    dfl_owns_dft,
+                    params.dflash_cross_ctx,
+                    params.n_max,
+                    params.n_min,
+                    params.p_min,
+                    params.n_max_base,
+                    n_seq));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_SUFFIX: {
@@ -1672,9 +1711,7 @@ void common_speculative_draft(common_speculative * spec) {
 void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
     common_speculative_impl * impl = spec->impl_last[seq_id];
 
-    GGML_ASSERT(impl);
-
-    {
+    if (impl) {
         common_time_meas tm(impl->t_accept_us, !impl->gen_perf);
         if (n_accepted > 0) {
             impl->n_acc_drafts++;
@@ -1718,5 +1755,221 @@ void common_speculative_print_stats(const common_speculative * spec) {
                 impl->n_gen_tokens,
                 impl->n_acc_tokens,
                 str_perf.c_str());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DFlash dispatch wrappers
+// ---------------------------------------------------------------------------
+
+void common_speculative_set_seq_id(common_speculative * spec, llama_seq_id seq_id) {
+    if (!spec) return;
+    for (auto & impl : spec->impls) { impl->set_seq_id(seq_id); }
+}
+
+void common_speculative_update_logits(common_speculative * spec, llama_context * ctx,
+        const llama_tokens & batch_tokens, int n_accepted) {
+    if (!spec) return;
+    for (auto & impl : spec->impls) { impl->update_logits(ctx, batch_tokens, n_accepted); }
+}
+
+void common_speculative_update_logits_by_indices(common_speculative * spec, llama_context * ctx,
+        const std::vector<int> & capture_indices) {
+    if (!spec) return;
+    for (auto & impl : spec->impls) { impl->update_logits_by_indices(ctx, capture_indices); }
+}
+
+int common_speculative_flush_prefill(common_speculative * spec, int src_offset, int n_tokens) {
+    if (!spec) return 0;
+    for (auto & impl : spec->impls) {
+        int written = impl->flush_prefill(src_offset, n_tokens);
+        if (written > 0) return written;
+    }
+    return 0;
+}
+
+void common_speculative_set_prefill_capture_enabled(common_speculative * spec, bool enabled) {
+    if (!spec) return;
+    for (auto & impl : spec->impls) { impl->set_prefill_capture_enabled(enabled); }
+}
+
+void common_speculative_discard_dflash_state(common_speculative * spec, const char * reason) {
+    if (!spec) return;
+    for (auto & impl : spec->impls) { impl->discard_dflash_state(reason); }
+}
+
+void common_speculative_note_prefill_suffix_scheduled(common_speculative * spec) {
+    if (!spec) return;
+    for (auto & impl : spec->impls) { impl->note_prefill_suffix_scheduled(); }
+}
+
+size_t common_speculative_ring_state_size(const common_speculative * spec) {
+    if (!spec) return 0;
+    for (const auto & impl : spec->impls) {
+        size_t sz = impl->ring_state_size();
+        if (sz > 0) return sz;
+    }
+    return 0;
+}
+
+bool common_speculative_ring_state_save(const common_speculative * spec, uint8_t * buf, size_t size) {
+    if (!spec) return false;
+    for (const auto & impl : spec->impls) {
+        if (impl->ring_state_size() > 0) return impl->ring_state_save(buf, size);
+    }
+    return false;
+}
+
+bool common_speculative_ring_state_load(common_speculative * spec, const uint8_t * buf, size_t size) {
+    if (!spec) return false;
+    for (auto & impl : spec->impls) {
+        if (impl->type == COMMON_SPECULATIVE_TYPE_DFLASH) return impl->ring_state_load(buf, size);
+    }
+    return false;
+}
+
+common_dflash_ring_stats common_speculative_dflash_ring_stats(const common_speculative * spec) {
+    if (!spec) return {};
+    for (const auto & impl : spec->impls) {
+        auto s = impl->dflash_ring_stats();
+        if (s.cross_ctx > 0) return s;
+    }
+    return {};
+}
+
+int common_speculative_prepare_batch_draft(common_speculative * spec, llama_context * ctx_dft) {
+    if (!spec) return -1;
+    for (auto & impl : spec->impls) {
+        int r = impl->prepare_batch_draft(ctx_dft);
+        if (r >= 0) return r;
+    }
+    return -1;
+}
+
+common_speculative_tree common_speculative_draft_tree(
+        common_speculative * spec,
+        const common_params_speculative & params,
+        const llama_tokens & prompt,
+        llama_token id_last,
+        int tree_budget) {
+    common_speculative_tree tree;
+    if (!spec) return tree;
+    for (auto & impl : spec->impls) {
+        impl->draft_tree(params, prompt, id_last, tree_budget, tree);
+        if (tree.n_nodes > 0) {
+            impl->n_call_draft++;
+            impl->n_gen_drafts++;
+            impl->n_gen_tokens += tree.n_nodes;
+            break;
+        }
+    }
+    return tree;
+}
+
+void common_speculative_draft_batch(
+        std::vector<common_speculative *> & specs,
+        llama_context                     * ctx_dft,
+        const common_params_speculative   & params,
+        const std::vector<llama_token>    & id_last_per_spec,
+        std::vector<llama_tokens>         & result_per_spec,
+        std::vector<std::vector<float>>   * log_probs_per_spec) {
+    const int n_specs = (int) specs.size();
+    result_per_spec.clear();
+    result_per_spec.resize(n_specs);
+    if (log_probs_per_spec) {
+        log_probs_per_spec->clear();
+        log_probs_per_spec->resize(n_specs);
+    }
+    if (n_specs == 0 || !ctx_dft) return;
+
+    const llama_model * model_dft = llama_get_model(ctx_dft);
+    const int block_size = llama_model_dflash_block_size(model_dft);
+    const int n_draft = std::min(block_size - 1, params.n_max);
+    const int batch_len = n_draft + 1;
+    const llama_token mask_tok = (llama_token) llama_model_dflash_mask_token_id(model_dft);
+
+    struct ready_slot {
+        common_speculative_impl * impl;
+        int cross_len, draft_pos_base;
+        llama_seq_id seq_id;
+        int spec_idx;
+    };
+    std::vector<ready_slot> ready;
+
+    for (int s = 0; s < n_specs; s++) {
+        for (auto & impl : specs[s]->impls) {
+            if (impl->type != COMMON_SPECULATIVE_TYPE_DFLASH) continue;
+            const int cross_len = impl->prepare_batch_draft(ctx_dft);
+            if (cross_len < 0) break;
+            auto * dfl = static_cast<common_speculative_impl_dflash *>(impl.get());
+            ready.push_back({ impl.get(), cross_len, dfl->active_state().committed_len, dfl->active_seq_id, s });
+            break;
+        }
+    }
+    if (ready.empty()) return;
+
+    const int n_ready = (int) ready.size();
+    llama_set_dflash_n_slots(ctx_dft, n_ready);
+
+    for (const auto & rs : ready) {
+        llama_memory_seq_rm(llama_get_memory(ctx_dft), rs.seq_id, rs.draft_pos_base, -1);
+    }
+
+    llama_batch batch = llama_batch_init(n_ready * batch_len, 0, 1);
+    for (const auto & rs : ready) {
+        common_batch_add(batch, id_last_per_spec[rs.spec_idx], rs.draft_pos_base, { rs.seq_id }, true);
+        for (int i = 1; i < batch_len; i++) {
+            common_batch_add(batch, mask_tok, rs.draft_pos_base + i, { rs.seq_id }, true);
+        }
+    }
+
+    const int ret = llama_decode(ctx_dft, batch);
+    llama_batch_free(batch);
+    if (ret != 0) {
+        LOG_ERR("dflash batch: decode failed with %d\n", ret);
+        return;
+    }
+
+    const int32_t * argmax = llama_get_logits_argmax(ctx_dft);
+    const float * argmax_probs = llama_get_logits_argmax_probs(ctx_dft);
+    const int K_flat = llama_get_logits_argmax_k(ctx_dft);
+    const int argmax_rows = llama_get_logits_argmax_n(ctx_dft);
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
+
+    for (int r = 0; r < n_ready; r++) {
+        auto & rs = ready[r];
+        auto & result = result_per_spec[rs.spec_idx];
+        std::vector<float> * lp = log_probs_per_spec ? &(*log_probs_per_spec)[rs.spec_idx] : nullptr;
+        const int offset = r * batch_len;
+
+        if (argmax) {
+            if (!common_dflash_argmax_shape_valid(__func__, argmax_rows, n_ready * batch_len, K_flat)) {
+                result.clear();
+                return;
+            }
+            for (int i = 1; i < batch_len && (int) result.size() < n_draft; i++) {
+                if (argmax_probs && params.p_min > 0.0f && (int) result.size() >= params.n_min) {
+                    if (argmax_probs[(offset + i) * K_flat] < std::log(params.p_min)) break;
+                }
+                const int32_t token_raw = argmax[(offset + i) * K_flat];
+                if (!common_dflash_argmax_token_valid(token_raw, n_vocab)) {
+                    result.clear();
+                    break;
+                }
+                result.push_back((llama_token) token_raw);
+                if (lp && argmax_probs) lp->push_back(argmax_probs[(offset + i) * K_flat]);
+            }
+        } else {
+            for (int i = 1; i < batch_len && (int) result.size() < n_draft; i++) {
+                float * logits = llama_get_logits_ith(ctx_dft, offset + i);
+                if (!logits) break;
+                result.push_back((llama_token)(std::max_element(logits, logits + n_vocab) - logits));
+            }
+        }
+        rs.impl->n_call_draft++;
+        if (!result.empty()) {
+            rs.impl->n_gen_drafts++;
+            rs.impl->n_gen_tokens += result.size();
+        }
     }
 }

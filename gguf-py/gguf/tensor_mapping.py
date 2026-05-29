@@ -171,6 +171,12 @@ class TensorNameMap:
         MODEL_TENSOR.A_QF_PROJ_LINEAR: (
             "projector.linear",
         ),
+        MODEL_TENSOR.DFLASH_FC: (
+            "fc",
+        ),
+        MODEL_TENSOR.DFLASH_HIDDEN_NORM: (
+            "hidden_norm",
+        ),
     }
 
     block_mappings_cfg: dict[MODEL_TENSOR, tuple[str, ...]] = {

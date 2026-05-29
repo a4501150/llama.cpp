@@ -392,6 +392,10 @@ extern "C" {
         // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)
         struct llama_sampler_seq_config * samplers;
         size_t                            n_samplers;
+
+        // DFlash cross-attention speculative decoding
+        int32_t dflash_n_slots;    // drafter graph width [1..LLAMA_DFLASH_MAX_SLOTS], set BEFORE llama_init_from_model
+        int32_t dflash_cross_ctx;  // cross-attn window in tokens (default 512)
     };
 
     struct llama_model_tensor_override {
@@ -1576,6 +1580,93 @@ extern "C" {
             int64_t                   idata_split,
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval);
+
+    //
+    // DFlash: cross-attention speculative decoding
+    //
+
+    // model metadata queries
+    LLAMA_API int32_t llama_model_dflash_block_size       (const struct llama_model * model);
+    LLAMA_API int32_t llama_model_dflash_mask_token_id    (const struct llama_model * model);
+    LLAMA_API int32_t llama_model_dflash_n_target_layers  (const struct llama_model * model);
+    LLAMA_API int32_t llama_model_dflash_n_target_features(const struct llama_model * model);
+    LLAMA_API int32_t llama_model_dflash_target_layer_ids (const struct llama_model * model, int32_t * layer_ids, int32_t capacity);
+
+    // hidden state accessors (per-slot)
+    LLAMA_API float * llama_get_layer_hidden         (struct llama_context * ctx, int slot);
+    LLAMA_API int64_t llama_get_layer_hidden_n_tokens(struct llama_context * ctx, int slot);
+    LLAMA_API int64_t llama_get_layer_hidden_n_embd  (struct llama_context * ctx, int slot);
+    LLAMA_API int32_t llama_get_n_layer_hiddens      (struct llama_context * ctx);
+
+    // GPU argmax accessors
+    LLAMA_API const int32_t * llama_get_logits_argmax     (struct llama_context * ctx);
+    LLAMA_API const int32_t * llama_get_logits_argmax_ith (struct llama_context * ctx, int32_t i);
+    LLAMA_API int32_t         llama_get_logits_argmax_n   (struct llama_context * ctx);
+    LLAMA_API int32_t         llama_get_logits_argmax_k   (struct llama_context * ctx);
+    LLAMA_API const float *   llama_get_logits_argmax_probs    (struct llama_context * ctx);
+    LLAMA_API const float *   llama_get_logits_argmax_probs_ith(struct llama_context * ctx, int32_t i);
+
+    // capture configuration
+    LLAMA_API void llama_set_dflash_capture       (struct llama_context * ctx, const int32_t * layer_ids, int32_t n_layers);
+    LLAMA_API void llama_set_dflash_capture_active(struct llama_context * ctx, bool active);
+    LLAMA_API void llama_set_dflash_gpu_capture   (struct llama_context * ctx, bool enabled);
+    LLAMA_API void llama_set_dflash_sample_temp   (struct llama_context * ctx, float temp);
+    LLAMA_API void llama_set_dflash_topk          (struct llama_context * ctx, int k);
+    LLAMA_API void llama_set_dflash_verify_logits (struct llama_context * ctx, bool enabled, int top_k);
+    LLAMA_API void llama_set_dflash_consume_reduced(struct llama_context * ctx, bool enabled);
+    LLAMA_API void llama_set_dflash_n_slots       (struct llama_context * ctx, int n);
+    LLAMA_API void llama_set_tape_recording       (struct llama_context * ctx, bool enable);
+    LLAMA_API void llama_set_force_split_seq      (struct llama_context * ctx, bool force);
+
+    // slot management
+    LLAMA_API void llama_dflash_allocate_slots  (struct llama_context * ctx, int n_slots);
+    LLAMA_API void llama_dflash_set_active_slot (struct llama_context * ctx, int slot_idx);
+
+    // tape replay
+    LLAMA_API void llama_tape_replay     (struct llama_context * ctx, llama_seq_id seq_id, int n_accepted);
+    LLAMA_API void llama_tape_replay_sync(struct llama_context * ctx);
+    LLAMA_API void llama_dflash_rollback (struct llama_context * ctx, llama_seq_id seq_id, llama_seq_id seq_backup, llama_pos n_past_before, int n_accepted);
+    LLAMA_API void llama_dflash_prepare_branch(struct llama_context * ctx, llama_seq_id seq_id, llama_seq_id seq_backup, int depth);
+    LLAMA_API bool llama_dflash_memory_seq_cp_recurrent_ordered(struct llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1);
+
+    // cross-attention data
+    LLAMA_API void   llama_set_cross_data    (struct llama_context * ctx, const float * data, int64_t n_embd, int64_t n_tokens);
+    LLAMA_API void   llama_set_cross_data_seq(struct llama_context * ctx, llama_seq_id seq_id, const float * data, int64_t n_embd, int64_t n_tokens);
+
+    // GPU cross ring
+    LLAMA_API void * llama_dflash_cross_ring_gpu_init       (struct llama_context * ctx, int n_layers, int n_embd, int ring_size);
+    LLAMA_API void   llama_dflash_cross_ring_gpu_free       (void * handle);
+    LLAMA_API void   llama_dflash_cross_ring_gpu_write      (void * handle, int layer, int ring_pos, const float * data, int n_tokens, int n_embd);
+    LLAMA_API bool   llama_dflash_cross_ring_gpu_write_hidden(void * handle, struct llama_context * ctx, int layer, int ring_pos, int src_offset, int n_tokens, int n_embd);
+    LLAMA_API bool   llama_dflash_prefill_gpu_write_hidden  (void * handle, struct llama_context * ctx, int slot, int layer, int ring_pos, int src_offset, int n_tokens, int n_embd);
+    LLAMA_API bool   llama_dflash_prefill_gpu_active        (struct llama_context * ctx);
+    LLAMA_API int64_t llama_dflash_prefill_gpu_n_tokens     (struct llama_context * ctx, int slot);
+    LLAMA_API void   llama_dflash_cross_ring_gpu_synchronize(void * handle);
+    LLAMA_API bool   llama_dflash_cross_ring_gpu_snapshot   (void * handle, int ring_write_pos, int ring_filled, int ctx_window, float * data, int n_tokens, int n_layers, int n_embd);
+    LLAMA_API void   llama_dflash_cross_ring_gpu_set_cross  (struct llama_context * ctx, void * handle, llama_seq_id seq_id, int ring_write_pos, int ring_filled, int n_layers, int n_embd, int ctx_window);
+
+    // prefill capture
+    LLAMA_API void llama_dflash_prefill_capture_begin(struct llama_context * ctx, llama_seq_id seq_id, int32_t capture_begin, int32_t capture_end);
+    LLAMA_API void llama_dflash_prefill_capture_end  (struct llama_context * ctx);
+    LLAMA_API bool llama_dflash_prefill_capture_info (struct llama_context * ctx, llama_seq_id seq_id, int32_t * n_tokens, int32_t * n_written);
+
+    // KV cache
+    LLAMA_API bool llama_dflash_kv_cache_init   (struct llama_context * ctx, int ctx_size);
+    LLAMA_API void llama_dflash_kv_cache_reset  (struct llama_context * ctx);
+    LLAMA_API bool llama_dflash_kv_cache_update (struct llama_context * ctx, int n_tokens);
+    LLAMA_API bool llama_dflash_kv_cache_prepare(struct llama_context * ctx, int ctx_window);
+    LLAMA_API bool llama_dflash_kv_cache_update_from_ring(
+            struct llama_context * ctx, void * ring_handle,
+            int ring_write_pos, int ring_filled,
+            int n_layers, int n_embd, int n_tokens);
+    LLAMA_API bool llama_dflash_target_kv_cache_update_from_ring(
+            struct llama_context * ctx, void * ring_handle,
+            int ring_write_pos, int ring_filled,
+            int n_layers, int n_embd, int n_tokens,
+            llama_seq_id seq_id, llama_pos start_pos);
+
+    // model tensor sharing (share tok_embd and output tensors from src to dst)
+    LLAMA_API void llama_model_share_tensors(struct llama_model * dst, const struct llama_model * src);
 
 #ifdef __cplusplus
 }

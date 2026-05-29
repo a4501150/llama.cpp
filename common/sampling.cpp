@@ -703,6 +703,96 @@ bool common_sampler_is_in_reasoning(const struct common_sampler * gsmpl) {
     return state == REASONING_BUDGET_COUNTING || state == REASONING_BUDGET_FORCING || state == REASONING_BUDGET_WAITING_UTF8;
 }
 
+bool common_sampler_blocks_speculative(const struct common_sampler * gsmpl) {
+    if (!gsmpl) {
+        return true;
+    }
+    // Conservative: block speculative when any grammar is active.
+    // TODO: check only triggered lazy grammars when llama_sampler_grammar_is_active is available.
+    if (gsmpl->grmr) {
+        return true;
+    }
+    return common_reasoning_budget_get_state(gsmpl->rbudget) == REASONING_BUDGET_FORCING;
+}
+
+bool common_sampler_supports_reduced(struct common_sampler * gsmpl) {
+    if (!gsmpl) {
+        return false;
+    }
+    if (gsmpl->grmr) {
+        return false;
+    }
+    return common_reasoning_budget_get_state(gsmpl->rbudget) != REASONING_BUDGET_FORCING;
+}
+
+std::vector<llama_token> common_sampler_sample_reduced_and_accept_n(
+        struct common_sampler * gsmpl,
+        const llama_token     * candidate_ids,
+        const float           * candidate_logits,
+        int32_t                 n_rows,
+        int32_t                 k,
+        const llama_tokens    & draft) {
+    GGML_ASSERT(gsmpl != nullptr);
+    GGML_ASSERT(candidate_ids != nullptr);
+    GGML_ASSERT(candidate_logits != nullptr);
+    GGML_ASSERT(n_rows == (int32_t) draft.size() + 1 && "n_rows must be draft.size() + 1");
+    GGML_ASSERT(k > 0);
+
+    if (!common_sampler_supports_reduced(gsmpl)) {
+        return {};
+    }
+
+    auto sample_row = [&](int32_t row) -> llama_token {
+        gsmpl->cur.resize(k);
+        const size_t row_off = (size_t) row * (size_t) k;
+        for (int32_t i = 0; i < k; ++i) {
+            gsmpl->cur[i] = llama_token_data {
+                candidate_ids[row_off + i],
+                candidate_logits[row_off + i],
+                0.0f,
+            };
+        }
+        gsmpl->cur_p = { gsmpl->cur.data(), gsmpl->cur.size(), -1, false };
+        if (gsmpl->rbudget) {
+            llama_sampler_apply(gsmpl->rbudget, &gsmpl->cur_p);
+        }
+        llama_sampler_apply(gsmpl->chain, &gsmpl->cur_p);
+
+        GGML_ASSERT(gsmpl->cur_p.selected >= 0 && "no selected token during reduced sampling");
+        GGML_ASSERT((size_t) gsmpl->cur_p.selected < gsmpl->cur_p.size);
+
+        return gsmpl->cur_p.data[gsmpl->cur_p.selected].id;
+    };
+
+    std::vector<llama_token> result;
+    result.reserve((size_t) n_rows);
+
+    size_t i = 0;
+    for (; i < draft.size(); ++i) {
+        const llama_token id = sample_row((int32_t) i);
+
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+
+        if (common_sampler_blocks_speculative(gsmpl)) {
+            break;
+        }
+
+        if (draft[i] != id) {
+            break;
+        }
+    }
+
+    if (i == draft.size()) {
+        const llama_token id = sample_row((int32_t) i);
+
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+    }
+
+    return result;
+}
+
 std::string common_sampler_print(const struct common_sampler * gsmpl) {
     std::string result = "logits ";
 

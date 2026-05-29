@@ -347,6 +347,17 @@ struct common_params_speculative_ngram_cache {
     std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding
 };
 
+enum common_speculative_dm_controller {
+    COMMON_SPECULATIVE_DM_CONTROLLER_FRINGE,
+    COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT,
+};
+
+inline common_speculative_dm_controller common_speculative_dm_controller_from_name(const std::string & name) {
+    if (name == "fringe") return COMMON_SPECULATIVE_DM_CONTROLLER_FRINGE;
+    if (name == "profit") return COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT;
+    throw std::invalid_argument("unknown dm controller: " + name);
+}
+
 struct common_params_speculative {
     std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
 
@@ -368,8 +379,38 @@ struct common_params_speculative {
     float   suffix_spec_offset = 0.0f;
     float   suffix_min_prob    = 0.1f;
 
+    // DFlash params
+    llama_model * model_dft      = nullptr;
+    llama_context_params cparams_dft = llama_context_default_params();
+    int32_t dflash_cross_ctx     = 512;
+    int32_t n_max                = 8;
+    int32_t n_min                = 1;
+    int32_t n_max_base           = 0;
+    int32_t draft_topk           = 1;
+    float   sample_temp          = 0.0f;
+    float   p_min                = 0.0f;
+    int32_t branch_budget        = 0;
+    bool    branch_budget_explicit = false;
+    // adaptive draft-max management
+    bool    dm_adaptive            = true;
+    float   dm_fringe_min          = 0.30f;
+    float   dm_fringe_max          = 0.50f;
+    int32_t dm_off_dwell           = 8;
+    int32_t dm_explore_interval    = 12;
+    int32_t dm_min_reach           = 3;
+    int32_t dm_probe_interval      = 16;
+    float   dm_probe_fraction      = 0.25f;
+    common_speculative_dm_controller dm_controller = COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT;
+    float   dm_profit_min              = 0.05f;
+    float   dm_profit_raise_margin     = 0.05f;
+    float   dm_profit_lower_margin     = 0.05f;
+    float   dm_profit_ewma_alpha       = 0.15f;
+    int32_t dm_profit_min_samples      = 3;
+    int32_t dm_profit_warmup           = 0;
+    int32_t dm_profit_baseline_interval = 1024;
+
     bool has_dft() const {
-        return !draft.mparams.path.empty() || !draft.mparams.hf_repo.empty();
+        return !draft.mparams.path.empty() || !draft.mparams.hf_repo.empty() || model_dft != nullptr;
     }
 
     uint32_t need_n_rs_seq() const {

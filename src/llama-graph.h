@@ -34,6 +34,20 @@ enum llm_graph_type {
     LLM_GRAPH_TYPE_ENCODER,
     LLM_GRAPH_TYPE_DECODER,
     LLM_GRAPH_TYPE_DECODER_MTP,
+    LLM_GRAPH_TYPE_DFLASH_KV_UPDATE,
+};
+
+struct llama_dflash_kv_cache_view {
+    int n_layers = 0;
+    int64_t n_embd_head = 0;
+    int64_t n_head_kv = 0;
+    int64_t ctx_len = 0;
+    int64_t n_filled = 0;
+    int64_t ring_size = 0;
+    int64_t write_pos = 0;
+
+    std::vector<ggml_tensor *> k_ring;
+    std::vector<ggml_tensor *> v_ring;
 };
 
 enum llm_ffn_op_type {
@@ -60,18 +74,32 @@ enum llm_norm_type {
 
 // TODO: tmp - need something better to pass the data from the encoder to the decoder
 struct llama_cross {
-    // the output embeddings from the encoder as a ggml tensor
-    // TODO: this needs more work to be correct, for now copy the embeddings data to host memory
-    //       ref: https://github.com/ggml-org/llama.cpp/pull/11213#discussion_r1969892524
-    //ggml_tensor * t_embd = nullptr;
+    int64_t n_embd     = 0;
+    int64_t n_enc      = 0;
+    int64_t n_enc_real = 0;
 
-    int64_t n_embd = 0;
-    int64_t n_enc  = 0;
-
-    // embeddings data copied to host memory (tmp)
     std::vector<float> v_embd;
 
-    // needed to construct the cross-attention mask in the decoder
+    const void * v_embd_gpu = nullptr;
+    int64_t v_embd_gpu_n_enc_real = 0;
+    void (*fn_set_tensor_d2d)(void * d_dst, const void * d_src, size_t offset, size_t size) = nullptr;
+
+    const void * dflash_kv_update_gpu = nullptr;
+    int64_t dflash_kv_update_n_embd = 0;
+    int64_t dflash_kv_update_n_enc_real = 0;
+    void (*dflash_kv_update_fn_set_tensor_d2d)(void * d_dst, const void * d_src, size_t offset, size_t size) = nullptr;
+
+    struct seq_cross {
+        int64_t n_enc      = 0;
+        int64_t n_enc_real = 0;
+        std::vector<float> v_embd;
+        const void * v_embd_gpu = nullptr;
+        int64_t v_embd_gpu_n_enc_real = 0;
+    };
+    std::map<llama_seq_id, seq_cross> v_embd_per_seq;
+
+    llama_dflash_kv_cache_view * dflash_kv_cache = nullptr;
+
     std::vector<std::set<llama_seq_id>> seq_ids_enc;
 };
 
@@ -728,10 +756,14 @@ public:
     // important graph nodes
     ggml_tensor * t_inp_tokens  = nullptr;
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
-    ggml_tensor * t_logits      = nullptr;
-    ggml_tensor * t_embd        = nullptr;
-    ggml_tensor * t_embd_pooled = nullptr;
-    ggml_tensor * t_h_pre_norm  = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    ggml_tensor * t_logits        = nullptr;
+    ggml_tensor * t_embd          = nullptr;
+    ggml_tensor * t_embd_pooled   = nullptr;
+    ggml_tensor * t_h_pre_norm    = nullptr;
+    ggml_tensor * t_logits_argmax = nullptr; // DFlash: GPU argmax output
+
+    std::vector<ggml_tensor *> dflash_k_update; // DFlash: per-layer K tensors from KV-update graph
+    std::vector<ggml_tensor *> dflash_v_update; // DFlash: per-layer V tensors from KV-update graph
 
     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor*> t_candidates;

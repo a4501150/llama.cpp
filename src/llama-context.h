@@ -4,6 +4,7 @@
 #include "llama-ext.h"
 #include "llama-cparams.h"
 #include "llama-graph.h"
+#include "llama-dflash.h"
 #include "llama-adapter.h"
 #include "llama-impl.h"
 
@@ -211,6 +212,102 @@ struct llama_context {
             int64_t                          ndata_in_loop,
             int64_t                          t_loop_start);
 
+    //
+    // DFlash: cross-attention speculative decoding
+    //
+
+    // hidden state accessors
+    float * get_layer_hidden(int layer_idx);
+    int64_t get_layer_hidden_n_tokens(int layer_idx) const;
+    int64_t get_layer_hidden_n_embd(int layer_idx) const;
+    int32_t get_n_layer_hiddens() const;
+
+    // capture configuration
+    void set_dflash_capture(const int32_t * layer_ids, int32_t n_layers);
+    void set_dflash_capture_active(bool active);
+    void set_dflash_gpu_capture(bool enabled);
+    void set_dflash_sample_temp(float temp);
+    void set_dflash_topk(int k);
+    void set_dflash_verify_logits(bool enabled, int top_k);
+    void set_dflash_consume_reduced(bool enabled);
+    void set_dflash_n_slots(int n);
+    void dflash_reset_hidden_capture();
+    void set_tape_recording(bool enable);
+    void dflash_ensure_recurrent_setup();
+
+    // GPU buffer allocation
+    void allocate_tape_gpu(int max_tokens);
+    void allocate_tape_gpu(int n_slots, int max_tokens);
+    void allocate_hidden_gpu(int n_slots, int max_tokens);
+    bool allocate_prefill_gpu(int n_slots, int max_tokens);
+    bool dflash_wait_for_gpu_capture_stream();
+
+    // slot control
+    void set_active_dflash_slot(int slot_idx);
+
+    // tape replay
+    void tape_replay(llama_seq_id seq_id, int n_accepted);
+    void tape_replay_sync();
+    bool tape_replay_conv_gpu(llama_memory_recurrent * mem, int32_t cell_idx, int n_accepted);
+    bool tape_replay_conv_gpu(llama_memory_recurrent * mem, int32_t cell_idx, int n_accepted, bool advance_pos);
+    bool tape_replay_gdn_direct_gpu(llama_memory_recurrent * mem, int32_t cell_idx, int n_accepted);
+    bool tape_replay_gdn_direct_from_cpu_tape(llama_memory_recurrent * mem, int32_t cell_idx, int n_accepted);
+    bool tape_replay_conv_gpu_from_cpu_tape(llama_memory_recurrent * mem, int32_t cell_idx, int n_accepted, llama_seq_id seq_id);
+    void tape_replay_conv(llama_memory_recurrent * mem, int32_t cell_idx, int n_accepted, llama_seq_id seq_id);
+    void tape_replay_cpu(llama_memory_recurrent * mem, int32_t cell_idx, int n_accepted);
+    bool dflash_memory_seq_cp_recurrent_ordered(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1);
+
+    // rollback and branch
+    void dflash_rollback(llama_seq_id seq_id, llama_seq_id seq_backup, llama_pos n_past_before, int n_accepted);
+    void dflash_prepare_branch(llama_seq_id seq_id, llama_seq_id seq_backup, int depth);
+
+    // cross-attention data
+    void set_cross_data(const float * data, int64_t n_embd, int64_t n_tokens);
+    void set_cross_data_seq(llama_seq_id seq_id, const float * data, int64_t n_embd, int64_t n_tokens);
+    using set_tensor_d2d_fn_t = void (*)(void *, const void *, size_t, size_t);
+    void set_cross_data_gpu(llama_seq_id seq_id, const void * d_staging, int cross_len, int n_layers, int n_embd, set_tensor_d2d_fn_t fn_d2d);
+    void * init_cross_ring_gpu(int n_layers, int n_embd, int ring_size);
+    bool cross_ring_gpu_write_hidden(void * handle, int layer, int ring_pos, int src_offset, int n_tokens, int n_embd);
+    bool prefill_gpu_write_hidden(void * handle, int slot, int layer, int ring_pos, int src_offset, int n_tokens, int n_embd);
+
+    // KV cache
+    bool dflash_kv_cache_init(int ctx_size);
+    void dflash_kv_cache_reset();
+    bool dflash_kv_cache_update(int n_tokens);
+    bool dflash_kv_cache_update_gpu(const void * d_hidden, int n_tokens, int n_layers, int n_embd_layer, set_tensor_d2d_fn_t fn_d2d);
+    bool dflash_target_kv_cache_update_gpu(llama_seq_id seq_id, llama_pos start_pos, const void * d_hidden, int n_tokens, int n_layers, int n_embd_layer, set_tensor_d2d_fn_t fn_d2d);
+    bool dflash_kv_cache_prepare(int ctx_window);
+
+    // prefill capture
+    void dflash_prefill_capture_begin(llama_seq_id seq_id, int32_t capture_begin, int32_t capture_end);
+    void dflash_prefill_capture_end();
+    bool dflash_prefill_capture_info(llama_seq_id seq_id, int32_t * n_tokens, int32_t * n_written) const;
+
+    bool prefill_gpu_active() const {
+        if (!dflash_capture) return false;
+        for (const auto & p : dflash_capture->prefill_gpu) {
+            if (p && p->n_tokens > 0) return true;
+        }
+        return false;
+    }
+
+    int64_t prefill_gpu_n_tokens(int slot) const {
+        if (!dflash_capture || slot < 0 || slot >= (int) dflash_capture->prefill_gpu.size()) return 0;
+        auto * pg = dflash_capture->prefill_gpu[slot].get();
+        return pg ? pg->n_tokens : 0;
+    }
+
+    // decode loop shims (implemented in llama-dflash.cpp)
+    void dflash_prepare_ubatch_impl(const llama_ubatch & ubatch);
+    void dflash_post_ubatch_impl(const llama_ubatch & ubatch, const llm_graph_result * res, ggml_status status, int n_outputs, int64_t n_vocab);
+    void dflash_post_decode_profile(int64_t n_vocab);
+
+    // argmax accessors (for C-API)
+    const int32_t * get_logits_argmax_data() const { return logits_argmax_buf.data(); }
+    const float *   get_logits_argmax_probs_data() const { return logits_argmax_prob_buf.data(); }
+    int get_logits_argmax_count() const { return logits_argmax_count; }
+    int get_logits_argmax_k_val() const { return logits_argmax_k; }
+
 private:
     //
     // output
@@ -374,4 +471,16 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    // DFlash state
+    std::vector<std::vector<dflash_layer_hidden_buf>> layer_hiddens;
+    std::unique_ptr<dflash_capture_data> dflash_capture;
+    std::unique_ptr<dflash_kv_cache_data> dflash_kv_cache;
+    bool dflash_kv_cache_multi_gpu_fallback_logged = false;
+
+    // DFlash argmax/topK readback buffers (filled by dflash_post_ubatch_impl)
+    std::vector<int32_t> logits_argmax_buf;
+    std::vector<float>   logits_argmax_prob_buf;
+    int logits_argmax_count = 0;
+    int logits_argmax_k     = 0;
 };

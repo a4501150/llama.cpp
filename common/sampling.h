@@ -85,6 +85,18 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
 
+// DFlash reduced-verify helpers
+bool common_sampler_blocks_speculative(const struct common_sampler * gsmpl);
+bool common_sampler_supports_reduced(struct common_sampler * gsmpl);
+
+std::vector<llama_token> common_sampler_sample_reduced_and_accept_n(
+        struct common_sampler * gsmpl,
+        const llama_token     * candidate_ids,
+        const float           * candidate_logits,
+        int32_t                 n_rows,
+        int32_t                 k,
+        const llama_tokens    & draft);
+
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
 // helpers

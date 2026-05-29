@@ -139,6 +139,8 @@ enum llm_arch {
     LLM_ARCH_MAINCODER,
     LLM_ARCH_KIMI_LINEAR,
     LLM_ARCH_TALKIE,
+    LLM_ARCH_DFLASH,
+    LLM_ARCH_DFLASH_DRAFT,
     LLM_ARCH_UNKNOWN,
 };
 
@@ -282,6 +284,11 @@ enum llm_kv {
     LLM_KV_KDA_HEAD_DIM,
 
     LLM_KV_WKV_HEAD_SIZE,
+
+    LLM_KV_DFLASH_BLOCK_SIZE,
+    LLM_KV_DFLASH_MASK_TOKEN_ID,
+    LLM_KV_DFLASH_TARGET_LAYER_IDS,
+    LLM_KV_DFLASH_N_TARGET_FEATURES,
 
     LLM_KV_TOKENIZER_MODEL,
     LLM_KV_TOKENIZER_PRE,
@@ -557,6 +564,8 @@ enum llm_tensor {
     LLM_TENSOR_NEXTN_HNORM,
     LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,
     LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,
+    LLM_TENSOR_DFLASH_FC,
+    LLM_TENSOR_DFLASH_HIDDEN_NORM,
 };
 
 enum llm_tensor_layer {
@@ -635,8 +644,9 @@ llm_arch llm_arch_from_string(const std::string & name);
 
 const llm_tensor_info & llm_tensor_info_for(llm_tensor tensor);
 
-bool llm_arch_is_recurrent      (const llm_arch & arch);
-bool llm_arch_is_hybrid         (const llm_arch & arch);
-bool llm_arch_is_diffusion      (const llm_arch & arch);
-bool llm_arch_supports_sm_tensor(const llm_arch & arch);
+bool llm_arch_is_recurrent       (const llm_arch & arch);
+bool llm_arch_is_hybrid          (const llm_arch & arch);
+bool llm_arch_is_diffusion       (const llm_arch & arch);
+bool llm_arch_is_dflash_drafter  (const llm_arch & arch);
+bool llm_arch_supports_sm_tensor (const llm_arch & arch);
 bool llm_arch_supports_rs_rollback(const llm_arch & arch);

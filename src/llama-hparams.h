@@ -217,6 +217,13 @@ struct llama_hparams {
     // gemma4 per-layer embedding
     uint32_t n_embd_per_layer = 0;
 
+    // DFlash cross-attention speculative decoding
+    uint32_t dflash_block_size        = 0;
+    uint32_t dflash_mask_token_id     = 0;
+    uint32_t dflash_n_target_features = 0;
+    uint32_t dflash_n_target_layers   = 0;
+    int32_t  dflash_target_layer_ids[LLAMA_DFLASH_MAX_SLOTS] = {};
+
     // needed by encoder-decoder models (e.g. T5, FLAN-T5)
     // ref: https://github.com/ggml-org/llama.cpp/pull/8141
     llama_token dec_start_token_id = LLAMA_TOKEN_NULL;

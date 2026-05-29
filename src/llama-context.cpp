@@ -85,6 +85,11 @@ llama_context::llama_context(
 
     cparams.ctx_type          = params.ctx_type;
 
+    // DFlash: drafter graph width = n_slots × dflash_cross_ctx
+    cparams.dflash_n_slots = std::clamp(params.dflash_n_slots <= 0 ? 1 : params.dflash_n_slots,
+                                        1, (int) LLAMA_DFLASH_MAX_SLOTS);
+    cparams.dflash_cross_ctx = params.dflash_cross_ctx > 0 ? params.dflash_cross_ctx : 512;
+
     // Initialize backend samplers here so they are part of the sampling graph
     // before the reserve passes run later in this function. This avoids a later
     // re-reserve when graph nodes change.
@@ -405,6 +410,7 @@ llama_context::~llama_context() {
             }
         }
     }
+    dflash_kv_cache.reset();
     ggml_opt_free(opt_ctx);
 }
 
@@ -1763,8 +1769,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
+    // DFlash: reset hidden-state capture so this decode()'s eval callback
+    // accumulates across ubatches from a clean state.
+    dflash_reset_hidden_capture();
+
     do {
         const auto & ubatch = mctx->get_ubatch();
+
+        // DFlash: configure cparams for GPU capture / eval callback routing
+        if (dflash_capture) {
+            dflash_prepare_ubatch_impl(ubatch);
+        }
 
         // count the outputs in this ubatch
         {
@@ -1822,6 +1837,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
         //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
         //}
 
+        // DFlash: GPU stream sync, prefill accounting, argmax readback
+        if (dflash_capture) {
+            dflash_post_ubatch_impl(ubatch, res, status, n_outputs, n_vocab);
+        }
+
         auto * t_logits        = res->get_logits();
         auto * t_embd          = cparams.embeddings          ? res->get_embd()        : nullptr;
         auto * t_h_pre_norm    = cparams.embeddings_pre_norm ? res->get_h_pre_norm()  : nullptr;
@@ -1830,18 +1850,35 @@ int llama_context::decode(const llama_batch & batch_inp) {
             t_embd = res->get_embd_pooled();
         }
 
-        // extract logits
-        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
-            ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
-            GGML_ASSERT(backend_res != nullptr);
-            GGML_ASSERT(logits.data != nullptr);
+        // extract logits (skip when DFlash reduced verifier consumed compact top-K)
+        {
+            const bool dflash_reduced_consumed =
+                res->t_logits_argmax != nullptr && cparams.dflash_reduced_consumer_active;
+            const bool raw_logits_needed =
+                logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers);
+            if (dflash_capture && dflash_reduced_consumed && raw_logits_needed && dflash_capture->profile) {
+                dflash_capture->profile_raw_logits_skipped += n_outputs;
+            }
+            if (raw_logits_needed && !dflash_reduced_consumed) {
+                ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
+                GGML_ASSERT(backend_res != nullptr);
+                GGML_ASSERT(logits.data != nullptr);
 
-            float * logits_out = logits.data + n_outputs_prev*n_vocab;
+                float * logits_out = logits.data + n_outputs_prev*n_vocab;
 
-            if (n_outputs) {
-                GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
-                GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                if (n_outputs) {
+                    GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
+                    GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
+                    const size_t bytes = (size_t) n_outputs * (size_t) n_vocab * sizeof(float);
+                    const int64_t t_start_us = dflash_capture && dflash_capture->profile ? ggml_time_us() : 0;
+                    ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, bytes);
+                    if (dflash_capture && dflash_capture->profile) {
+                        const int64_t elapsed_us = ggml_time_us() - t_start_us;
+                        dflash_capture->profile_raw_logits_us += elapsed_us;
+                        dflash_capture->profile_output_extract_us += elapsed_us;
+                        dflash_capture->profile_raw_logits_bytes += bytes;
+                    }
+                }
             }
         }
 
@@ -1993,6 +2030,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    dflash_post_decode_profile(n_vocab);
 
     return 0;
 }
@@ -3366,6 +3405,8 @@ llama_context_params llama_context_default_params() {
         /*.kv_unified                  =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
+        /*.dflash_n_slots              =*/ 1,
+        /*.dflash_cross_ctx            =*/ LLAMA_DFLASH_PER_SLOT_CTX,
     };
 
     return result;

@@ -4,6 +4,7 @@
 #include "server-common.h"
 #include "server-http.h"
 #include "server-loop-guard.h"
+#include "server-dflash.h"
 #include "server-task.h"
 #include "server-queue.h"
 
@@ -68,6 +69,7 @@ struct server_slot {
     llama_tokens spec_draft;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
+    std::vector<int32_t> spec_pad_i_batch;
     common_prompt_checkpoint spec_ckpt;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
@@ -171,6 +173,16 @@ struct server_slot {
     common_sampler_ptr smpl;
 
     llama_token sampled; // in speculative mode, this is the last accepted token
+    common_speculative_tree draft_tree;
+    bool has_draft_tree = false;
+
+    // DFlash state
+    bool dflash_suppressed_for_reasoning_tool_marker = false;
+    server_slot_dflash_stats dflash_stats;
+    bool has_draft_backup = false;
+    llama_seq_id seq_id_backup = -1;
+    int  n_tokens_before_draft = 0;
+    llama_pos n_pos_before_draft = 0;
 
     // stats
     size_t n_sent_text = 0; // number of sent text character
@@ -207,11 +219,16 @@ struct server_slot {
         loop_guard_action = "";
         loop_guard_reason = "";
 
+        dflash_suppressed_for_reasoning_tool_marker = false;
+
         if (can_speculate()) {
             spec_draft.clear();
-            spec_i_batch.clear();
             spec_ckpt.clear();
         }
+        spec_i_batch.clear();
+        spec_pad_i_batch.clear();
+        draft_tree = common_speculative_tree();
+        has_draft_tree = false;
         generated_tokens.clear();
         generated_token_probs.clear();
         json_schema = json();
@@ -219,6 +236,11 @@ struct server_slot {
         // clear speculative decoding stats
         n_draft_total = 0;
         n_draft_accepted = 0;
+        dflash_stats.reset();
+        has_draft_backup = false;
+        seq_id_backup = -1;
+        n_tokens_before_draft = 0;
+        n_pos_before_draft = 0;
 
         task_prev = std::move(task);
         task.reset();
@@ -349,7 +371,11 @@ struct server_slot {
             SLT_DBG(*this, "generate_draft: id=%d, #tokens=%zu, #draft=%zu, pos_next=%d\n",
                     sampled, prompt.tokens.size(), spec_draft.size(), prompt.tokens.pos_next());
 
-            GGML_ASSERT(spec_i_batch.empty());
+            if (!spec_i_batch.empty()) {
+                SLT_WRN(*this, "spec_i_batch not empty (size=%zu), clearing\n", spec_i_batch.size());
+                spec_i_batch.clear();
+                spec_pad_i_batch.clear();
+            }
 
             spec_i_batch.push_back(batch.n_tokens);
             for (size_t i = 0; i < spec_draft.size(); i++) {
@@ -632,6 +658,168 @@ struct server_metrics {
 };
 
 
+// ---------------------------------------------------------------------------
+// DFlash slot-dependent helpers (defined after server_slot)
+// ---------------------------------------------------------------------------
+
+static bool dflash_slot_in_view(const server_slot & slot, const llama_batch & view) {
+    for (int32_t j = 0; j < view.n_tokens; ++j) {
+        for (int32_t k = 0; k < view.n_seq_id[j]; ++k) {
+            if (view.seq_id[j][k] == slot.id) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool dflash_view_has_unexpected_prompt_logits(
+        const llama_batch              & view,
+        const std::vector<server_slot> & slots) {
+    if (!view.logits) {
+        return false;
+    }
+    for (const auto & slot : slots) {
+        if (!slot.task || !slot.task->need_sampling()) {
+            continue;
+        }
+        if (slot.state != SLOT_STATE_PROCESSING_PROMPT && slot.state != SLOT_STATE_DONE_PROMPT) {
+            continue;
+        }
+        if (!dflash_slot_in_view(slot, view)) {
+            continue;
+        }
+        const int32_t final_prompt_pos = slot.task->n_tokens() - 1;
+        for (int32_t j = 0; j < view.n_tokens; ++j) {
+            if (!view.logits[j]) {
+                continue;
+            }
+            bool belongs_to_slot = false;
+            for (int32_t k = 0; k < view.n_seq_id[j]; ++k) {
+                if (view.seq_id[j][k] == slot.id) {
+                    belongs_to_slot = true;
+                    break;
+                }
+            }
+            if (belongs_to_slot && view.pos[j] != final_prompt_pos) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool dflash_batch_view_is_reduced_verify(
+        const std::vector<server_slot> & slots,
+        const common_params_sampling   & fallback_sampling,
+        const common_params_speculative & speculative,
+        bool                             use_rejection,
+        bool                             has_tree,
+        int32_t                          view_start,
+        int32_t                          view_n_tokens,
+        int                              top_k,
+        const char                    ** reason) {
+    auto reject = [&](const char * why) {
+        if (reason) *reason = why;
+        return false;
+    };
+
+    if (view_n_tokens <= 0 || top_k <= 0) {
+        return reject("empty-view");
+    }
+
+    std::vector<uint8_t> covered((size_t) view_n_tokens, 0);
+    int covered_count = 0;
+
+    for (const auto & slot : slots) {
+        if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() || slot.has_draft_tree || slot.spec_draft.empty()) {
+            continue;
+        }
+        if (!common_sampler_supports_reduced(slot.smpl.get())) {
+            return reject("sampler");
+        }
+        const common_params_sampling & slot_sampling = slot.task ? slot.task->params.sampling : fallback_sampling;
+        const dflash_reduced_verify_plan slot_plan =
+            dflash_select_reduced_verify_plan(slot_sampling, speculative, use_rejection, has_tree);
+        if (!slot_plan.enabled) {
+            return reject(slot_plan.reason);
+        }
+        if (slot_plan.top_k != top_k) {
+            return reject("top-k-mismatch");
+        }
+        if (slot.spec_i_batch.size() != slot.spec_draft.size() + 1) {
+            return reject("spec-index-count");
+        }
+
+        auto cover_index = [&](int idx) {
+            if (idx < view_start || idx >= view_start + view_n_tokens) return false;
+            const int rel = idx - view_start;
+            if (covered[(size_t) rel] != 0) return false;
+            covered[(size_t) rel] = 1;
+            covered_count++;
+            return true;
+        };
+
+        for (int idx : slot.spec_i_batch) {
+            if (!cover_index(idx)) {
+                return reject(idx < view_start || idx >= view_start + view_n_tokens
+                        ? "spec-index-outside-view" : "duplicate-index");
+            }
+        }
+        for (int idx : slot.spec_pad_i_batch) {
+            if (!cover_index(idx)) {
+                return reject(idx < view_start || idx >= view_start + view_n_tokens
+                        ? "pad-index-outside-view" : "duplicate-index");
+            }
+        }
+    }
+
+    if (covered_count != view_n_tokens ||
+            !std::all_of(covered.begin(), covered.end(), [](uint8_t v) { return v != 0; })) {
+        return reject("coverage");
+    }
+
+    if (reason) *reason = "eligible";
+    return true;
+}
+
+static dflash_reduced_verify_plan dflash_select_batch_reduced_verify_plan(
+        const std::vector<server_slot> & slots,
+        const common_params_sampling   & fallback_sampling,
+        const common_params_speculative & speculative,
+        bool                             use_rejection,
+        bool                             has_tree) {
+    dflash_reduced_verify_plan selected;
+    bool found = false;
+
+    for (const auto & slot : slots) {
+        if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() || slot.has_draft_tree || slot.spec_draft.empty()) {
+            continue;
+        }
+        const common_params_sampling & slot_sampling = slot.task ? slot.task->params.sampling : fallback_sampling;
+        const dflash_reduced_verify_plan slot_plan =
+            dflash_select_reduced_verify_plan(slot_sampling, speculative, use_rejection, has_tree);
+
+        if (!slot_plan.enabled) continue;
+
+        if (!found) {
+            selected = slot_plan;
+            found = true;
+            continue;
+        }
+        if (slot_plan.top_k != selected.top_k) {
+            selected.enabled = false;
+            selected.reason = "top-k-mismatch";
+            return selected;
+        }
+    }
+
+    if (!found) {
+        selected.reason = "no-eligible-slot";
+    }
+    return selected;
+}
+
 //
 // server_context_impl (private implementation)
 //
@@ -681,6 +869,7 @@ private:
 
     llama_model_ptr model_dft;
     llama_context_ptr ctx_dft;
+    llama_context_ptr ctx_dft_shared; // DFlash: shared drafter context for all slots
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
@@ -949,6 +1138,37 @@ private:
 
             params_base.speculative.draft.ctx_tgt = ctx_tgt;
             params_base.speculative.draft.ctx_dft = ctx_dft.get();
+
+            // DFlash auto-detect: if the drafter has a DFlash block_size, enable DFlash
+            const int dflash_block_size = llama_model_dflash_block_size(model_dft.get());
+            if (dflash_block_size > 0) {
+                bool has_dflash = false;
+                for (auto t : params_base.speculative.types) {
+                    if (t == COMMON_SPECULATIVE_TYPE_DFLASH) { has_dflash = true; break; }
+                }
+                if (!has_dflash) {
+                    params_base.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_DFLASH);
+                    SRV_INF("auto-detected DFlash drafter (block_size=%d)\n", dflash_block_size);
+                }
+                // share target model tensors (tok_embd, output) with drafter
+                llama_model_share_tensors(model_dft.get(), model_tgt);
+                params_base.speculative.model_dft = model_dft.get();
+
+                // create shared DFlash drafter context
+                const int dflash_slots_cap = params_base.n_parallel;
+                // resolve "auto" sample_temp
+                if (params_base.speculative.sample_temp < 0.0f) {
+                    params_base.speculative.sample_temp = params_base.sampling.temp;
+                }
+                ctx_dft_shared.reset(common_speculative_create_ctx_dft(params_base.speculative, dflash_slots_cap));
+                if (ctx_dft_shared) {
+                    params_base.speculative.draft.ctx_dft = ctx_dft_shared.get();
+                    SRV_INF("DFlash shared drafter context created, slots_cap=%d, cross_ctx=%d\n",
+                            dflash_slots_cap, params_base.speculative.dflash_cross_ctx);
+                } else {
+                    SRV_ERR("%s", "failed to create DFlash shared drafter context\n");
+                }
+            }
         } else if (std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(),
                              COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end()) {
             SRV_INF("creating MTP draft context against the target model '%s'\n",
@@ -1061,6 +1281,14 @@ private:
             ctx_dft.reset();
         }
 
+        // DFlash slot cap
+        const bool has_dflash_spec = std::any_of(params_base.speculative.types.begin(),
+                params_base.speculative.types.end(),
+                [](auto t) { return t == COMMON_SPECULATIVE_TYPE_DFLASH; });
+        const int dflash_slots_cap = has_dflash_spec
+            ? params_base.n_parallel
+            : 0;
+
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot & slot = slots[i];
 
@@ -1080,6 +1308,17 @@ private:
             };
 
             slot.reset();
+
+            // DFlash per-slot seq_id
+            if (spec && i < dflash_slots_cap) {
+                common_speculative_set_seq_id(spec.get(), slot.id);
+            }
+        }
+
+        // DFlash: allocate per-slot GPU buffers on the target context
+        if (dflash_slots_cap > 0 && spec) {
+            llama_dflash_allocate_slots(ctx_tgt, dflash_slots_cap);
+            SRV_INF("DFlash allocated %d slot buffers on target context\n", dflash_slots_cap);
         }
 
         {
@@ -2348,6 +2587,10 @@ private:
     }
 
     void update_slots() {
+        const bool has_dflash_spec = std::any_of(params_base.speculative.types.begin(),
+                params_base.speculative.types.end(),
+                [](auto t) { return t == COMMON_SPECULATIVE_TYPE_DFLASH; });
+
         // check if all slots are idle
         {
             bool all_idle = true;
@@ -2413,7 +2656,7 @@ private:
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
 
                 common_context_seq_rm (ctx_tgt, slot.id, n_keep            , n_keep + n_discard);
-                common_context_seq_add(ctx_tgt, slot.id, n_keep + n_discard, slot.prompt.n_tokens(), -n_discard);
+                common_context_seq_add(ctx_tgt, slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
 
                 if (ctx_dft) {
                     common_context_seq_rm (ctx_dft.get(), slot.id, n_keep            , n_keep + n_discard);
@@ -2470,7 +2713,11 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                const int n_draft_max = slot.get_n_draft_max();
+                int n_draft_max = slot.get_n_draft_max();
+                // DFlash flat mode: clamp to block_size - 1
+                if (model_dft) {
+                    n_draft_max = dflash_flat_effective_draft_max(model_dft.get(), n_draft_max);
+                }
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
@@ -2493,11 +2740,13 @@ private:
                         }
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        slot.n_tokens_before_draft = slot.prompt.n_tokens();
+                        slot.n_pos_before_draft    = slot.prompt.tokens.pos_next();
 
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
                             /* .n_max    = */ n_draft_max,
-                            /* .n_past   = */ slot.prompt.n_tokens(),
+                            /* .n_past   = */ slot.prompt.tokens.pos_next(),
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
@@ -2507,6 +2756,11 @@ private:
                     }
                 }
             }
+        }
+
+        // DFlash: set the number of active drafting slots
+        if (has_dflash_spec && !drafting.empty()) {
+            llama_set_dflash_n_slots(ctx_tgt, (int) drafting.size());
         }
 
         // generate the actual drafts (if any)
@@ -3136,6 +3390,13 @@ private:
             n_empty_consecutive = 0;
         }
 
+        // DFlash: enable tape recording for the verify pass
+        bool dflash_tape_active = false;
+        if (has_dflash_spec && !drafting.empty()) {
+            llama_set_tape_recording(ctx_tgt, true);
+            dflash_tape_active = true;
+        }
+
         int32_t i_next = 0;
 
         // process the created batch of tokens
@@ -3320,6 +3581,7 @@ private:
                     slot.state = SLOT_STATE_GENERATING;
 
                     if (slot.can_speculate()) {
+                        llama_dflash_set_active_slot(ctx_tgt, slot.id);
                         common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                     }
                 } else if (slot.state != SLOT_STATE_GENERATING) {
@@ -3337,6 +3599,13 @@ private:
                 slot.i_batch = -1;
 
                 common_sampler_accept(slot.smpl.get(), id, true);
+
+                // DFlash: update hidden-state ring with the single accepted token
+                if (slot.can_speculate() && slot.n_decoded > 0) {
+                    llama_dflash_set_active_slot(ctx_tgt, slot.id);
+                    common_speculative_set_seq_id(spec.get(), slot.id);
+                    common_speculative_update_logits(spec.get(), ctx_tgt, {id}, 1);
+                }
 
                 // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
                 const int64_t t_current = ggml_time_us();
@@ -3392,6 +3661,7 @@ private:
                     GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                     auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                     slot.spec_i_batch.clear();
+                    slot.spec_pad_i_batch.clear();
 
                     GGML_ASSERT(accepted.size() >= 1);
 
@@ -3438,7 +3708,19 @@ private:
                         SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                     }
 
+                    // DFlash: update ring with accepted tokens BEFORE rollback
+                    {
+                        const int n_hidden_keep = (int) accepted.size();
+                        llama_dflash_set_active_slot(ctx_tgt, slot.id);
+                        common_speculative_set_seq_id(spec.get(), slot.id);
+                        llama_tokens batch_tokens(accepted.begin(), accepted.end());
+                        common_speculative_update_logits(spec.get(), ctx_tgt, batch_tokens, n_hidden_keep);
+                    }
+
                     common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+
+                    // DFlash: record cycle stats
+                    slot.dflash_stats.note_cycle((int) n_draft, (int) n_draft, (int) accepted.size() - 1);
 
                     slot.spec_draft = std::move(accepted);
                 }
@@ -3459,7 +3741,14 @@ private:
                 slot.sampled = ids.back(); // last accepted token
                 SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
-                common_context_seq_rm(slot.ctx_tgt, slot.id, slot.prompt.tokens.pos_next(), -1);
+                // DFlash rollback or standard seq_rm
+                if (has_dflash_spec && ids.size() <= n_draft) {
+                    llama_dflash_set_active_slot(ctx_tgt, slot.id);
+                    llama_dflash_rollback(ctx_tgt, slot.id, slot.id + params_base.n_parallel,
+                            slot.n_pos_before_draft, (int) ids.size());
+                } else {
+                    common_context_seq_rm(slot.ctx_tgt, slot.id, slot.prompt.tokens.pos_next(), -1);
+                }
                 if (slot.ctx_dft) {
                     common_context_seq_rm(slot.ctx_dft, slot.id, slot.prompt.tokens.pos_next(), -1);
                 }
@@ -3488,7 +3777,15 @@ private:
                 slot.print_timings_tg();
 
                 SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) ids.size() - 1, (int) n_draft, slot.prompt.n_tokens());
+
+                slot.spec_i_batch.clear();
+                slot.spec_pad_i_batch.clear();
             }
+        }
+
+        // DFlash: disable tape recording
+        if (dflash_tape_active) {
+            llama_set_tape_recording(ctx_tgt, false);
         }
 
         SRV_DBG("%s", "run slots completed\n");

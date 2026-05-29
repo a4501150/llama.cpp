@@ -289,6 +289,9 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_kimi_linear(params);
         case LLM_ARCH_STEP35:
             return new llama_model_step35(params);
+        case LLM_ARCH_DFLASH:
+        case LLM_ARCH_DFLASH_DRAFT:
+            return new llama_model_dflash_draft(params);
         default:
             throw std::runtime_error(std::string("unsupported model architecture: '") + llm_arch_name(arch) + "'");
     }
@@ -2398,6 +2401,10 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_HUNYUAN_VL:
             return model->hparams.use_mrope() ? LLAMA_ROPE_TYPE_MROPE : LLAMA_ROPE_TYPE_NEOX;
 
+        case LLM_ARCH_DFLASH:
+        case LLM_ARCH_DFLASH_DRAFT:
+            return LLAMA_ROPE_TYPE_NEOX;
+
         // all model arches should be listed explicitly here
         case LLM_ARCH_UNKNOWN:
             GGML_ABORT("unknown architecture");
@@ -2527,6 +2534,36 @@ bool llama_model_is_hybrid(const llama_model * model) {
 
 bool llama_model_is_diffusion(const llama_model * model) {
     return llm_arch_is_diffusion(model->arch);
+}
+
+void llama_model_share_tensors(llama_model * dst, const llama_model * src) {
+    dst->tok_embd = src->tok_embd;
+    dst->output   = src->output;
+}
+
+int32_t llama_model_dflash_block_size(const llama_model * model) {
+    return (int32_t) model->hparams.dflash_block_size;
+}
+
+int32_t llama_model_dflash_mask_token_id(const llama_model * model) {
+    return (int32_t) model->hparams.dflash_mask_token_id;
+}
+
+int32_t llama_model_dflash_n_target_layers(const llama_model * model) {
+    return (int32_t) model->hparams.dflash_n_target_layers;
+}
+
+int32_t llama_model_dflash_n_target_features(const llama_model * model) {
+    return (int32_t) model->hparams.dflash_n_target_features;
+}
+
+int32_t llama_model_dflash_target_layer_ids(const llama_model * model, int32_t * layer_ids, int32_t capacity) {
+    int32_t n = (int32_t) model->hparams.dflash_n_target_layers;
+    if (n > capacity) n = capacity;
+    for (int32_t i = 0; i < n; ++i) {
+        layer_ids[i] = model->hparams.dflash_target_layer_ids[i];
+    }
+    return n;
 }
 
 const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_tensor_map(const llama_model * model) {

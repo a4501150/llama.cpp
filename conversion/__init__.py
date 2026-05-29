@@ -44,6 +44,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "CohereForCausalLM": "command_r",
     "DbrxForCausalLM": "dbrx",
     "DeciLMForCausalLM": "deci",
+    "DFlashDraftModel": "dflash",
     "DeepseekForCausalLM": "deepseek",
     "DeepseekV2ForCausalLM": "deepseek",
     "DeepseekV3ForCausalLM": "deepseek",
