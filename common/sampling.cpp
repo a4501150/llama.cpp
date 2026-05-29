@@ -694,6 +694,14 @@ llama_token common_sampler_last(const struct common_sampler * gsmpl) {
     return gsmpl->prev.rat(0);
 }
 
+bool common_sampler_is_in_reasoning(const struct common_sampler * gsmpl) {
+    if (!gsmpl->rbudget) {
+        return false;
+    }
+    const auto state = common_reasoning_budget_get_state(gsmpl->rbudget);
+    return state == REASONING_BUDGET_COUNTING || state == REASONING_BUDGET_FORCING || state == REASONING_BUDGET_WAITING_UTF8;
+}
+
 std::string common_sampler_print(const struct common_sampler * gsmpl) {
     std::string result = "logits ";
 

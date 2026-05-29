@@ -97,6 +97,9 @@ llama_token_data_array * common_sampler_get_candidates(struct common_sampler * g
 // get the last accepted token
 llama_token common_sampler_last(const struct common_sampler * gsmpl);
 
+// returns true if the sampler is currently inside a reasoning block (e.g. <think>...</think>)
+bool common_sampler_is_in_reasoning(const struct common_sampler * gsmpl);
+
 // print the sampler chain into a string
 std::string common_sampler_print(const struct common_sampler * gsmpl);
 

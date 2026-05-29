@@ -3,6 +3,7 @@
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
+#include "server-loop-guard.h"
 #include "server-task.h"
 #include "server-queue.h"
 
@@ -103,6 +104,13 @@ struct server_slot {
 
     std::string stopping_word;
 
+    // reasoning loop guard
+    server_loop_guard loop_guard;
+    int32_t loop_guard_interventions = 0;
+    bool loop_guard_triggered = false;
+    std::string loop_guard_action;
+    std::string loop_guard_reason;
+
     // state
     slot_state state = SLOT_STATE_IDLE;
 
@@ -192,6 +200,12 @@ struct server_slot {
         stop           = STOP_TYPE_NONE;
         stopping_word  = "";
         n_sent_text    = 0;
+
+        loop_guard.reset();
+        loop_guard_interventions = 0;
+        loop_guard_triggered = false;
+        loop_guard_action = "";
+        loop_guard_reason = "";
 
         if (can_speculate()) {
             spec_draft.clear();
@@ -1500,6 +1514,8 @@ private:
 
         slot.task = std::make_unique<const server_task>(std::move(task));
 
+        slot.loop_guard = server_loop_guard(params_base.reasoning_loop_guard);
+
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
             : SLOT_STATE_STARTED;
@@ -1627,6 +1643,34 @@ private:
                 slot.has_next_token = false;
 
                 SLT_DBG(slot, "stopped by time limit, n_decoded = %d, t_max_predict_ms = %d ms\n", slot.n_decoded, (int) slot.task->params.t_max_predict_ms);
+            }
+        }
+
+        // reasoning loop guard: detect and stop repetitive generation
+        if (!llama_vocab_is_eog(vocab, result.tok) && slot.has_next_token) {
+            const bool in_reasoning = slot.smpl && common_sampler_is_in_reasoning(slot.smpl.get());
+            const auto region = in_reasoning ? SERVER_LOOP_REGION_REASONING : SERVER_LOOP_REGION_VISIBLE;
+
+            slot.loop_guard.accept(result.tok, region);
+            if (slot.loop_guard.should_check(region, false, false)) {
+                const auto loop_result = slot.loop_guard.check(region);
+                if (loop_result.triggered) {
+                    slot.loop_guard_triggered = true;
+                    slot.loop_guard_reason = loop_result.kind;
+                    slot.loop_guard_action = "stop";
+                    slot.stop = STOP_TYPE_LIMIT;
+                    slot.has_next_token = false;
+
+                    SLT_INF(slot,
+                            "reasoning-loop-guard: triggered region=%s kind=%s period=%d coverage=%d score=%.3f action=%s n_decoded=%d\n",
+                            in_reasoning ? "reasoning" : "visible",
+                            loop_result.kind.c_str(),
+                            loop_result.period,
+                            loop_result.coverage,
+                            (double) loop_result.score,
+                            slot.loop_guard_action.c_str(),
+                            slot.n_decoded);
+                }
             }
         }
 

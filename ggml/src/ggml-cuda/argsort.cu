@@ -4,7 +4,6 @@
 #    include <cub/cub.cuh>
 #    if (CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 1)
 #        define STRIDED_ITERATOR_AVAILABLE
-#        include <cuda/iterator>
 #    endif
 using namespace cub;
 #endif  // GGML_CUDA_USE_CUB

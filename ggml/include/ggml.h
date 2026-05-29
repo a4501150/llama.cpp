@@ -429,7 +429,12 @@ extern "C" {
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
-        GGML_TYPE_COUNT   = 42,
+        GGML_TYPE_TURBO3_0    = 42,
+        GGML_TYPE_TURBO4_0    = 43,
+        GGML_TYPE_TURBO2_0    = 44,
+        GGML_TYPE_TURBO3_TCQ  = 45,
+        GGML_TYPE_TURBO2_TCQ  = 46,
+        GGML_TYPE_COUNT       = 47,
     };
 
     // precision
@@ -567,6 +572,9 @@ extern "C" {
         GGML_OP_RWKV_WKV7,
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
+        GGML_OP_GATED_DELTA_NET_TREE,
+        GGML_OP_SSM_CONV_TREE,
+        GGML_OP_TURBO_WHT,
 
         GGML_OP_UNARY,
 
@@ -2554,6 +2562,11 @@ extern "C" {
             struct ggml_tensor  * g,
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state);
+
+    GGML_API struct ggml_tensor * ggml_turbo_wht(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   direction);
 
     // custom operators
 

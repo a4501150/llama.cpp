@@ -62,6 +62,20 @@
             "CMAKE_CXX_COMPILER": "g++"
         }
     },
+    {
+        "name": "blackwell",
+        "inherits": [ "base", "x64-linux-gcc", "release" ],
+        "cacheVariables": {
+            "GGML_CUDA": "ON",
+            "CMAKE_CUDA_ARCHITECTURES": "120",
+            "CUDAToolkit_ROOT": "/usr/local/cuda-12.8",
+            "CMAKE_CUDA_COMPILER": "/usr/local/cuda-12.8/bin/nvcc",
+            "GGML_CUDA_F16": "ON",
+            "GGML_CUDA_FA_ALL_QUANTS": "ON",
+            "GGML_CUDA_FORCE_CUBLAS": "OFF"
+        }
+    },
+
     { "name": "x64-linux-gcc-debug", "inherits": [ "base", "x64-linux-gcc", "debug" ] },
     { "name": "x64-linux-gcc-release", "inherits": [ "base", "x64-linux-gcc", "release" ] },
     { "name": "x64-linux-gcc-reldbg", "inherits": [ "base", "x64-linux-gcc", "reldbg" ] },

@@ -181,6 +181,51 @@ typedef struct {
 } block_q1_0;
 static_assert(sizeof(block_q1_0) == sizeof(ggml_half) + QK1_0 / 8, "wrong q1_0 block size/padding");
 
+// TurboQuant 3-bit: 3-bit PolarQuant indices (2-bit lower + 1-bit sign)
+#define QK_TURBO3 128
+#define QK_TURBO3_GROUP 128
+typedef struct {
+    ggml_half  norm;
+    uint8_t    qs[QK_TURBO3 / 4];
+    uint8_t    signs[QK_TURBO3 / 8];
+} block_turbo3_0;
+static_assert(sizeof(block_turbo3_0) == sizeof(ggml_half) + QK_TURBO3/4 + QK_TURBO3/8, "wrong turbo3_0 block size/padding");
+
+// TurboQuant 2-bit: 2-bit PolarQuant indices
+#define QK_TURBO2 128
+#define QK_TURBO2_GROUP 128
+typedef struct {
+    ggml_half  norm;
+    uint8_t    qs[QK_TURBO2 / 4];
+} block_turbo2_0;
+static_assert(sizeof(block_turbo2_0) == sizeof(ggml_half) + QK_TURBO2/4, "wrong turbo2_0 block size/padding");
+
+// TurboQuant 3-bit TCQ: Trellis-Coded Quantization (k=3, L=9)
+#define QK_TURBO3_TCQ 128
+typedef struct {
+    ggml_half  norm;
+    uint8_t    qs[49];
+    uint8_t    pad;
+} block_turbo3_tcq;
+static_assert(sizeof(block_turbo3_tcq) == sizeof(ggml_half) + 50, "wrong turbo3_tcq block size/padding");
+
+// TurboQuant 2-bit TCQ: Trellis-Coded Quantization (k=2, L=8)
+#define QK_TURBO2_TCQ 128
+typedef struct {
+    ggml_half  norm;
+    uint8_t    qs[33];
+    uint8_t    pad;
+} block_turbo2_tcq;
+static_assert(sizeof(block_turbo2_tcq) == sizeof(ggml_half) + 34, "wrong turbo2_tcq block size/padding");
+
+// TurboQuant 4-bit: 16-level PolarQuant
+#define QK_TURBO4 128
+typedef struct {
+    ggml_half  norm;
+    uint8_t    qs[QK_TURBO4 / 2];
+} block_turbo4_0;
+static_assert(sizeof(block_turbo4_0) == sizeof(ggml_half) + QK_TURBO4/2, "wrong turbo4_0 block size/padding");
+
 #define QK4_0 32
 typedef struct {
     ggml_half d;           // delta

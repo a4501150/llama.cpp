@@ -166,6 +166,10 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
+    COMMON_SPECULATIVE_TYPE_SUFFIX,        // suffix-tree based speculation
+    COMMON_SPECULATIVE_TYPE_COPYSPEC,      // model-free speculation via rolling-hash suffix matching
+    COMMON_SPECULATIVE_TYPE_RECYCLE,       // bigram/logit adjacency speculation
+    COMMON_SPECULATIVE_TYPE_DFLASH,        // DFlash cross-attention speculative decoding
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
@@ -356,6 +360,14 @@ struct common_params_speculative {
 
     common_params_speculative_ngram_cache ngram_cache;
 
+    // CopySpec / Suffix / Recycle params
+    int32_t copyspec_gamma     = 6;
+    int32_t recycle_k          = 8;
+    int32_t suffix_max_depth   = 64;
+    float   suffix_spec_factor = 2.0f;
+    float   suffix_spec_offset = 0.0f;
+    float   suffix_min_prob    = 0.1f;
+
     bool has_dft() const {
         return !draft.mparams.path.empty() || !draft.mparams.hf_repo.empty();
     }
@@ -401,6 +413,22 @@ enum common_reasoning_format {
     // do not extend this enum unless you absolutely have to
     // in most cases, use COMMON_REASONING_FORMAT_AUTO
     // see: https://github.com/ggml-org/llama.cpp/pull/15408
+};
+
+enum common_reasoning_loop_guard_mode {
+    COMMON_REASONING_LOOP_GUARD_OFF,
+    COMMON_REASONING_LOOP_GUARD_FORCE_CLOSE,
+    COMMON_REASONING_LOOP_GUARD_STOP,
+};
+
+struct common_reasoning_loop_guard_params {
+    common_reasoning_loop_guard_mode mode = COMMON_REASONING_LOOP_GUARD_FORCE_CLOSE;
+    int32_t min_reasoning_tokens = 1024;
+    int32_t window_tokens = 2048;
+    int32_t max_period = 512;
+    int32_t min_repeated_coverage = 768;
+    int32_t check_interval = 32;
+    int32_t interventions_max = 1;
 };
 
 
@@ -472,6 +500,7 @@ struct common_params {
 
     struct common_params_sampling    sampling;
     struct common_params_speculative speculative;
+    common_reasoning_loop_guard_params reasoning_loop_guard;
     struct common_params_vocoder     vocoder;
     struct common_params_diffusion   diffusion;
 

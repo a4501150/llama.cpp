@@ -38,6 +38,11 @@
 
 #define LLAMA_TOKEN_NULL -1
 
+// DFlash constants
+#define LLAMA_DFLASH_MAX_VERIFY_TOKENS 25
+#define LLAMA_DFLASH_MAX_SLOTS         8
+#define LLAMA_DFLASH_PER_SLOT_CTX      512
+
 #define LLAMA_FILE_MAGIC_GGLA 0x67676c61u // 'ggla'
 #define LLAMA_FILE_MAGIC_GGSN 0x6767736eu // 'ggsn'
 #define LLAMA_FILE_MAGIC_GGSQ 0x67677371u // 'ggsq'

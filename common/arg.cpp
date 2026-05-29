@@ -398,6 +398,11 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_IQ4_NL,
     GGML_TYPE_Q5_0,
     GGML_TYPE_Q5_1,
+    GGML_TYPE_TURBO2_0,
+    GGML_TYPE_TURBO3_0,
+    GGML_TYPE_TURBO4_0,
+    GGML_TYPE_TURBO2_TCQ,
+    GGML_TYPE_TURBO3_TCQ,
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
@@ -931,6 +936,58 @@ bool common_params_to_map(int argc, char ** argv, llama_example ex, std::map<com
     return true;
 }
 
+static common_reasoning_loop_guard_mode common_reasoning_loop_guard_mode_from_name(const std::string & value) {
+    if (value == "off") {
+        return COMMON_REASONING_LOOP_GUARD_OFF;
+    }
+    if (value == "force-close") {
+        return COMMON_REASONING_LOOP_GUARD_FORCE_CLOSE;
+    }
+    if (value == "stop") {
+        return COMMON_REASONING_LOOP_GUARD_STOP;
+    }
+    throw std::invalid_argument("invalid reasoning-loop-guard, expected one of: off, force-close, stop");
+}
+
+static const char * common_reasoning_loop_guard_mode_name(common_reasoning_loop_guard_mode value) {
+    switch (value) {
+        case COMMON_REASONING_LOOP_GUARD_OFF:         return "off";
+        case COMMON_REASONING_LOOP_GUARD_FORCE_CLOSE: return "force-close";
+        case COMMON_REASONING_LOOP_GUARD_STOP:        return "stop";
+    }
+    return "unknown";
+}
+
+static void common_validate_reasoning_loop_guard_params(const common_reasoning_loop_guard_params & params) {
+    if (params.min_reasoning_tokens < 0) {
+        throw std::invalid_argument("reasoning-loop-min-tokens must be >= 0");
+    }
+    if (params.window_tokens <= 0) {
+        throw std::invalid_argument("reasoning-loop-window must be > 0");
+    }
+    if (params.max_period <= 0) {
+        throw std::invalid_argument("reasoning-loop-max-period must be > 0");
+    }
+    if (params.min_repeated_coverage <= 0) {
+        throw std::invalid_argument("reasoning-loop-min-coverage must be > 0");
+    }
+    if (params.check_interval <= 0) {
+        throw std::invalid_argument("reasoning-loop-check-interval must be > 0");
+    }
+    if (params.interventions_max < 0) {
+        throw std::invalid_argument("reasoning-loop-interventions must be >= 0");
+    }
+    if (params.window_tokens < params.min_repeated_coverage) {
+        throw std::invalid_argument("reasoning-loop-window must be >= reasoning-loop-min-coverage");
+    }
+    if (params.max_period > params.window_tokens / 3) {
+        throw std::invalid_argument("reasoning-loop-max-period must be <= reasoning-loop-window / 3");
+    }
+    if (params.min_reasoning_tokens < params.min_repeated_coverage) {
+        throw std::invalid_argument("reasoning-loop-min-tokens must be >= reasoning-loop-min-coverage");
+    }
+}
+
 bool common_params_parse(int argc, char ** argv, common_params & params, llama_example ex, void(*print_usage)(int, char **)) {
     auto ctx_arg = common_params_parser_init(params, ex, print_usage);
     const common_params params_org = ctx_arg.params; // the example can modify the default params
@@ -952,6 +1009,7 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             exit(0);
         }
         params.lr.init();
+        common_validate_reasoning_loop_guard_params(params.reasoning_loop_guard);
     } catch (const std::invalid_argument & ex) {
         fprintf(stderr, "%s\n", ex.what());
         ctx_arg.params = params_org;
@@ -3188,6 +3246,56 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET_MESSAGE"));
     add_opt(common_arg(
+        {"--reasoning-loop-guard"}, "MODE",
+        string_format("reasoning loop guard mode: off, force-close, or stop (default: %s)",
+            common_reasoning_loop_guard_mode_name(params.reasoning_loop_guard.mode)),
+        [](common_params & params, const std::string & value) {
+            params.reasoning_loop_guard.mode = common_reasoning_loop_guard_mode_from_name(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_LOOP_GUARD"));
+    add_opt(common_arg(
+        {"--reasoning-loop-min-tokens"}, "N",
+        string_format("minimum hidden reasoning tokens before loop checks (default: %d)", params.reasoning_loop_guard.min_reasoning_tokens),
+        [](common_params & params, int value) {
+            params.reasoning_loop_guard.min_reasoning_tokens = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_LOOP_MIN_TOKENS"));
+    add_opt(common_arg(
+        {"--reasoning-loop-window"}, "N",
+        string_format("token tail window for reasoning loop checks (default: %d)", params.reasoning_loop_guard.window_tokens),
+        [](common_params & params, int value) {
+            params.reasoning_loop_guard.window_tokens = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_LOOP_WINDOW"));
+    add_opt(common_arg(
+        {"--reasoning-loop-max-period"}, "N",
+        string_format("maximum periodic loop length to check (default: %d)", params.reasoning_loop_guard.max_period),
+        [](common_params & params, int value) {
+            params.reasoning_loop_guard.max_period = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_LOOP_MAX_PERIOD"));
+    add_opt(common_arg(
+        {"--reasoning-loop-min-coverage"}, "N",
+        string_format("minimum repeated token coverage before loop trigger (default: %d)", params.reasoning_loop_guard.min_repeated_coverage),
+        [](common_params & params, int value) {
+            params.reasoning_loop_guard.min_repeated_coverage = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_LOOP_MIN_COVERAGE"));
+    add_opt(common_arg(
+        {"--reasoning-loop-check-interval"}, "N",
+        string_format("accepted-token interval between loop checks (default: %d)", params.reasoning_loop_guard.check_interval),
+        [](common_params & params, int value) {
+            params.reasoning_loop_guard.check_interval = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_LOOP_CHECK_INTERVAL"));
+    add_opt(common_arg(
+        {"--reasoning-loop-interventions"}, "N",
+        string_format("maximum force-close interventions before stop (default: %d)", params.reasoning_loop_guard.interventions_max),
+        [](common_params & params, int value) {
+            params.reasoning_loop_guard.interventions_max = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_LOOP_INTERVENTIONS"));
+    add_opt(common_arg(
         {"--chat-template"}, "JINJA_TEMPLATE",
         string_format(
             "set custom jinja chat template (default: template taken from model's metadata)\n"
@@ -3807,6 +3915,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             arg_removed("use the respective --spec-ngram-*-min-hits");
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--spec-copyspec-gamma"}, "N",
+        string_format("CopySpec rolling-hash window size (default: %d)", params.speculative.copyspec_gamma),
+        [](common_params & params, int value) {
+            params.speculative.copyspec_gamma = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-recycle-k"}, "N",
+        string_format("Recycle top-k successors per token (default: %d)", params.speculative.recycle_k),
+        [](common_params & params, int value) {
+            params.speculative.recycle_k = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-suffix-max-depth"}, "N",
+        string_format("Suffix-tree max depth (default: %d)", params.speculative.suffix_max_depth),
+        [](common_params & params, int value) {
+            params.speculative.suffix_max_depth = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
     //
     // TTS params

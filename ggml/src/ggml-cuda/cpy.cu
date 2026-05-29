@@ -16,7 +16,6 @@ static __global__ void cpy_scalar(const char * cx, char * cdst, const int64_t ne
                                   const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
                                   const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11,
                                   const int64_t nb12, const int64_t nb13) {
-    ggml_cuda_pdl_lc();
     const int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
 
     if (i >= ne) {
@@ -37,7 +36,6 @@ static __global__ void cpy_scalar(const char * cx, char * cdst, const int64_t ne
     const int64_t i10 = i - i13*ne10*ne11*ne12 - i12*ne10*ne11 - i11*ne10;
     const int64_t dst_offset = i10*nb10 + i11*nb11 + i12*nb12 + i13 * nb13;
 
-    ggml_cuda_pdl_sync();
     cpy_1(cx + x_offset, cdst + dst_offset);
 }
 
@@ -61,7 +59,6 @@ static __global__ void cpy_scalar_transpose(const char * cx, char * cdst, const 
     __shared__ float tile[2][CUDA_CPY_TILE_DIM_2D][CUDA_CPY_TILE_DIM_2D+1];
     int cur_tile_buf = 0;
 
-    ggml_cuda_pdl_sync();
 #pragma unroll
     for (int i = 0; i < CUDA_CPY_BLOCK_NM; ++i) {
 
@@ -145,7 +142,6 @@ static __global__ void cpy_f32_q(const char * cx, char * cdst, const int64_t ne,
     const int64_t i10 = i - i13*ne10*ne11*ne12 - i12*ne10*ne11 - i11*ne10;
     const int64_t dst_offset = (i10/qk)*nb10 + i11*nb11 + i12*nb12 + i13*nb13;
 
-    ggml_cuda_pdl_sync();
     cpy_blck(cx + x_offset, cdst + dst_offset);
 }
 
@@ -172,7 +168,6 @@ static __global__ void cpy_q_f32(const char * cx, char * cdst, const int64_t ne,
     const int64_t i10 = i - i13*ne10*ne11*ne12 - i12*ne10*ne11 - i11*ne10;
     const int64_t dst_offset = i10*nb10 + i11*nb11 + i12*nb12 + i13*nb13;
 
-    ggml_cuda_pdl_sync();
     cpy_blck(cx + x_offset, cdst + dst_offset);
 }
 
@@ -187,7 +182,6 @@ static __global__ void cpy_scalar_contiguous(const char * cx, char * cdst, const
     const src_t * x = (const src_t *) cx;
     dst_t *     dst = (dst_t *) cdst;
 
-    ggml_cuda_pdl_sync();
     dst[i] = ggml_cuda_cast<dst_t>(x[i]);
 }
 
@@ -198,8 +192,8 @@ cudaStream_t stream) {
 
     const int64_t num_blocks = (ne + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
     GGML_ASSERT(num_blocks < UINT_MAX);
-    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream);
-    ggml_cuda_kernel_launch(cpy_scalar_contiguous<src_t, dst_t>, launch_params, cx, cdst, ne);
+    cpy_scalar_contiguous<src_t, dst_t><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>
+        (cx, cdst, ne);
 }
 
 template<typename src_t, typename dst_t, bool transposed = false>
@@ -229,15 +223,13 @@ static void ggml_cpy_scalar_cuda(
         GGML_ASSERT(grid_z < USHRT_MAX);
         dim3 dimGrid(grid_x, grid_y, grid_z);
         dim3 dimBlock(CUDA_CPY_TILE_DIM_2D, CUDA_CPY_BLOCK_ROWS, 1);
-        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(dimGrid, dimBlock, 0, stream);
-        ggml_cuda_kernel_launch(cpy_scalar_transpose<dst_t>, launch_params,
-            cx, cdst, ne, ne00n, ne01n, ne02n, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+        cpy_scalar_transpose<dst_t><<<dimGrid, dimBlock, 0, stream>>>
+            (cx, cdst, ne, ne00n, ne01n, ne02n, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
     } else {
         const int64_t num_blocks = (ne + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
         GGML_ASSERT(num_blocks < UINT_MAX);
-        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream);
-        ggml_cuda_kernel_launch(cpy_scalar<cpy_1_scalar<src_t, dst_t>>, launch_params,
-            cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+        cpy_scalar<cpy_1_scalar<src_t, dst_t>><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>
+            (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
     }
 }
 

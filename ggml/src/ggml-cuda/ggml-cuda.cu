@@ -2,7 +2,6 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
-#include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
@@ -24,7 +23,6 @@
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
-#include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
@@ -41,7 +39,6 @@
 #include "ggml-cuda/rope.cuh"
 #include "ggml-cuda/roll.cuh"
 #include "ggml-cuda/scale.cuh"
-#include "ggml-cuda/snake.cuh"
 #include "ggml-cuda/softcap.cuh"
 #include "ggml-cuda/softmax.cuh"
 #include "ggml-cuda/ssm-conv.cuh"
@@ -64,6 +61,7 @@
 #include "ggml-cuda/tri.cuh"
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
+#include "ggml-cuda/turbo-wht.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -87,9 +85,6 @@
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
-
-#define GGML_LOG_WARN_ONCE(str) \
-    { static std::once_flag warn_flag; std::call_once(warn_flag, []() { GGML_LOG_WARN(str); }); }
 
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
@@ -741,8 +736,7 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    CUDA_CHECK(cudaMemset(ctx->dev_ptr, value, buffer->size));
 }
 
 static const ggml_backend_buffer_i ggml_backend_cuda_buffer_interface = {
@@ -1144,46 +1138,70 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_split_buffer_type_inte
     /* .is_host          = */ ggml_backend_cuda_split_buffer_type_is_host,
 };
 
-// Communication context for multi-GPU AllReduce during tensor parallelism.
-//
-// Created once per meta backend instance.  Resources for the selected mode
-// (NCCL communicators or the internal AllReduce pipeline) are initialised
-// eagerly during comm_init so any init failure surfaces at startup rather
-// than mid-run.
-struct ggml_backend_cuda_comm_context {
-    using try_allreduce_fn = bool(*)(ggml_backend_cuda_comm_context *, struct ggml_tensor **);
-
-    std::vector<ggml_backend_t> backends;
-    std::vector<int>            dev_ids;
-
-    // Set by the init chain (comm_init_{nccl, internal, none}) to one of
-    // try_allreduce_{nccl, internal, butterfly}.  nccl needs `comms`,
-    // internal needs `ar_pipeline`, butterfly needs nothing.  Per-call
-    // failures return false; the meta backend's generic implementation then
-    // handles that call.
-    try_allreduce_fn            try_allreduce = nullptr;
-
-    ggml_cuda_ar_pipeline *     ar_pipeline = nullptr;
-
 #ifdef GGML_USE_NCCL
-    std::vector<ncclComm_t>     comms;
-#endif // GGML_USE_NCCL
+struct ggml_backend_cuda_comm_context {
+    std::vector<ggml_backend_t> backends;
+    std::vector<ncclComm_t> comms;
 
     ~ggml_backend_cuda_comm_context() {
-#ifdef GGML_USE_NCCL
         for (ncclComm_t comm : comms) {
             NCCL_CHECK(ncclCommDestroy(comm));
         }
-#endif // GGML_USE_NCCL
-        ggml_cuda_ar_pipeline_free(ar_pipeline);
     }
 };
+#endif // GGML_USE_NCCL
 
+static void ggml_backend_cuda_comm_free(void * comm_ctx_v) {
 #ifdef GGML_USE_NCCL
-// AllReduce via NCCL. Reduces as FP32 for small tensors and BF16 for large
-// tensors (bandwidth-bound), then converts back to FP32.
-static bool ggml_backend_cuda_comm_allreduce_nccl(
-        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+    if (comm_ctx_v == nullptr) {
+        return;
+    }
+    ggml_backend_cuda_comm_context * comm_ctx = (ggml_backend_cuda_comm_context *) comm_ctx_v;
+    delete comm_ctx;
+#else
+    GGML_UNUSED(comm_ctx_v);
+#endif // GGML_USE_NCCL
+}
+
+static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_backends) {
+#ifdef GGML_USE_NCCL
+    for (size_t i = 0; i < n_backends; i++) {
+        if (!ggml_backend_is_cuda(backends[i])) {
+            return nullptr;
+        }
+    }
+    ggml_backend_cuda_comm_context * ret = new ggml_backend_cuda_comm_context;
+    std::vector<int> dev_ids;
+    ret->backends.reserve(n_backends);
+    dev_ids.reserve(n_backends);
+    for (size_t i = 0; i < n_backends; i++) {
+        ret->backends.push_back(backends[i]);
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backends[i]->context;
+        dev_ids.push_back(cuda_ctx->device);
+    }
+
+    ret->comms.resize(n_backends);
+    NCCL_CHECK(ncclCommInitAll(ret->comms.data(), n_backends, dev_ids.data()));
+    return ret;
+#else
+    // If NCCL is installed it is used by default for optimal performance.
+    // However, NVIDIA does not distribute NCCL with CUDA so users may be unwittingly missing this package.
+    // RCCL is disabled by default, users are explicitly opting in.
+    // Therefore print no warning for RCCL.
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    static bool warning_printed = false;
+    if (!warning_printed) {
+        GGML_LOG_WARN("%s: NVIDIA Collective Communications Library (NCCL) is unavailable, multi GPU performance will be suboptimal\n", __func__);
+        warning_printed = true;
+    }
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(backends, n_backends);
+    return nullptr;
+#endif // GGML_USE_NCCL
+}
+
+static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct ggml_tensor ** tensors) {
+#ifdef GGML_USE_NCCL
     const int64_t ne = ggml_nelements(tensors[0]);
     // FIXME the input of llm_graph_context::build_in_out_ids can produce a tensor with 0 elements if n_outputs == 0
     // This then causes a crash in this function
@@ -1191,6 +1209,8 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
         return true;
     }
 
+    GGML_ASSERT(comm_ctx_v != nullptr);
+    ggml_backend_cuda_comm_context * comm_ctx = (ggml_backend_cuda_comm_context *) comm_ctx_v;
     const size_t n_backends = comm_ctx->backends.size();
 
     for (size_t i = 0; i < n_backends; ++i) {
@@ -1215,6 +1235,7 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
             NCCL_CHECK(ncclAllReduce(tensors[i]->data, tensors[i]->data, ne, ncclFloat, ncclSum, comm_ctx->comms[i], cuda_ctx->stream()));
         }
         NCCL_CHECK(ncclGroupEnd());
+
         return true;
     }
 
@@ -1253,184 +1274,10 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
     }
 
     return true;
-}
-#endif // GGML_USE_NCCL
-
-// Run the internal AR pipeline.  Returns false on unsupported / failed input
-// -- the caller decides whether to abort (env-forced) or fall back silently.
-static bool ggml_backend_cuda_comm_allreduce_internal(
-        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
-    GGML_ASSERT(comm_ctx->ar_pipeline != nullptr);
-
-    const size_t n_backends = comm_ctx->backends.size();
-    GGML_ASSERT(n_backends == 2);
-    GGML_ASSERT(tensors[0] != nullptr);
-
-    const int64_t   ne   = ggml_nelements(tensors[0]);
-    const ggml_type type = tensors[0]->type;
-
-    if (type != GGML_TYPE_F32 && type != GGML_TYPE_F16 && type != GGML_TYPE_BF16) {
-        GGML_LOG_DEBUG("%s: internal unsupported: type=%d\n", __func__, (int) type);
-        return false;
-    }
-
-    if (ne == 0) {
-        return true;
-    }
-
-    for (size_t i = 0; i < n_backends; ++i) {
-        if (tensors[i] == nullptr) {
-            GGML_LOG_ERROR("%s: internal failed: tensor[%zu] is null\n", __func__, i);
-            return false;
-        }
-        if (ggml_nelements(tensors[i]) != ne || tensors[i]->type != type) {
-            GGML_LOG_ERROR("%s: internal failed: tensor[%zu] ne=%" PRId64 " type=%d expected ne=%" PRId64 " type=%d\n",
-                           __func__, i, ggml_nelements(tensors[i]), (int) tensors[i]->type, ne, (int) type);
-            return false;
-        }
-        if (!ggml_is_contiguously_allocated(tensors[i])) {
-            GGML_LOG_DEBUG("%s: internal unsupported: tensor[%zu] is not contiguously allocated: ne=%" PRId64 " nbytes=%zu packed=%zu type=%d\n",
-                           __func__, i, ne, ggml_nbytes(tensors[i]),
-                           (size_t) ne * ggml_type_size(type) / ggml_blck_size(type), (int) type);
-            return false;
-        }
-        if (((uintptr_t) tensors[i]->data & 0xF) != 0) {
-            GGML_LOG_DEBUG("%s: internal unsupported: tensor[%zu] data pointer is not 16-byte aligned: %p type=%d ne=%" PRId64 "\n",
-                           __func__, i, tensors[i]->data, (int) type, ne);
-            return false;
-        }
-        GGML_ASSERT((ggml_nbytes(tensors[i]) & 0xF) == 0);
-    }
-
-    return ggml_cuda_ar_allreduce(comm_ctx->ar_pipeline, comm_ctx->backends.data(), tensors);
-}
-
-// ---------------------------------------------------------------------------
-// Per-call dispatch -- three variants, one per backend.  Each is set as
-// comm_ctx->try_allreduce by the matching init step.  Per-call failure
-// returns false; the meta backend's generic implementation handles that call.
-// ---------------------------------------------------------------------------
-
-#ifdef GGML_USE_NCCL
-static bool ggml_backend_cuda_comm_try_allreduce_nccl(
-        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
-    return ggml_backend_cuda_comm_allreduce_nccl(comm_ctx, tensors);
-}
-#endif // GGML_USE_NCCL
-
-static bool ggml_backend_cuda_comm_try_allreduce_internal(
-        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
-    return ggml_backend_cuda_comm_allreduce_internal(comm_ctx, tensors);
-}
-
-static bool ggml_backend_cuda_comm_try_allreduce_butterfly(
-        ggml_backend_cuda_comm_context *, struct ggml_tensor **) {
-    return false;
-}
-
-static void ggml_backend_cuda_comm_free(void * comm_ctx_v) {
-    if (comm_ctx_v == nullptr) {
-        return;
-    }
-    delete static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
-}
-
-// ---------------------------------------------------------------------------
-// Init -- chained nccl -> internal -> none.  Each step tries to bring up its
-// resource; on failure it warns and recurses into the next step.
-// ---------------------------------------------------------------------------
-static void ggml_backend_cuda_comm_init_none(ggml_backend_cuda_comm_context * ret) {
-    ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_butterfly;
-}
-
-static void ggml_backend_cuda_comm_init_internal(ggml_backend_cuda_comm_context * ret) {
-    ret->ar_pipeline = ggml_cuda_ar_pipeline_init(ret->dev_ids.data(), ret->dev_ids.size());
-    if (ret->ar_pipeline) {
-        ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_internal;
-        return;
-    }
-
-    // Clear sticky CUDA error from the failed init.
-    (void) cudaGetLastError();
-    GGML_LOG_WARN("internal AllReduce init failed (n_devices != 2?); "
-                  "falling back to meta-backend butterfly\n");
-    ggml_backend_cuda_comm_init_none(ret);
-}
-
-static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * ret) {
-#ifdef GGML_USE_NCCL
-    const size_t n = ret->dev_ids.size();
-    ret->comms.resize(n);
-    ncclResult_t rc = ncclCommInitAll(ret->comms.data(), (int) n, ret->dev_ids.data());
-    if (rc == ncclSuccess) {
-        ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_nccl;
-        return;
-    }
-
-    ret->comms.clear();
-    GGML_LOG_WARN("NCCL init failed (%s); falling back to internal AllReduce\n",
-                  ncclGetErrorString(rc));
-#else // GGML_USE_NCCL
-#ifndef GGML_USE_HIP
-    GGML_LOG_WARN("NCCL not compiled in; falling back to internal AllReduce.  "
-                  "Recompile with -DGGML_CUDA_NCCL=ON for best multi-GPU performance.\n");
-#endif // !GGML_USE_HIP
-#endif // GGML_USE_NCCL
-
-    ggml_backend_cuda_comm_init_internal(ret);
-}
-
-// Top-level init.  Picks one of the three init paths based on
-// GGML_CUDA_ALLREDUCE (or the platform default) and lets the chain handle
-// any fallback.  Unrecognised env values warn and fall through to the
-// platform default.
-static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_backends) {
-    for (size_t i = 0; i < n_backends; i++) {
-        if (!ggml_backend_is_cuda(backends[i])) {
-            return nullptr;
-        }
-    }
-
-    auto * ret = new ggml_backend_cuda_comm_context;
-    ret->backends.assign(backends, backends + n_backends);
-    ret->dev_ids.reserve(n_backends);
-    for (size_t i = 0; i < n_backends; i++) {
-        ret->dev_ids.push_back(static_cast<ggml_backend_cuda_context *>(backends[i]->context)->device);
-    }
-
-    const char * env = getenv("GGML_CUDA_ALLREDUCE");
-    if (!env) {
-        // Platform default: Linux uses NCCL, otherwise (generally Windows) internal
-#if defined(__linux__)
-        ggml_backend_cuda_comm_init_nccl(ret);
 #else
-        ggml_backend_cuda_comm_init_internal(ret);
-#endif // defined(__linux__)
-    } else {
-        std::string env_str(env);
-        if (env_str == "nccl") {
-            ggml_backend_cuda_comm_init_nccl(ret);
-        } else if (env_str == "internal") {
-            ggml_backend_cuda_comm_init_internal(ret);
-        } else if (env_str == "none") {
-            ggml_backend_cuda_comm_init_none(ret);
-        } else {
-            GGML_LOG_WARN("unknown GGML_CUDA_ALLREDUCE value: %s\n", env);
-            ggml_backend_cuda_comm_init_none(ret);
-        }
-    }
-
-    return ret;
-}
-
-// Top-level dispatch -- calls the function pointer chosen by comm_init.
-// Returns false to let the meta-backend's butterfly run.
-static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct ggml_tensor ** tensors) {
-    if (comm_ctx_v == nullptr) {
-        return false;
-    }
-    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
-    return comm_ctx->try_allreduce(comm_ctx, tensors);
+    GGML_UNUSED_VARS(comm_ctx_v, tensors);
+    return false;
+#endif // GGML_USE_NCCL
 }
 
 ggml_backend_buffer_type_t ggml_backend_cuda_split_buffer_type(int main_device, const float * tensor_split) {
@@ -1541,6 +1388,12 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
     return &ggml_backend_cuda_buffer_type_host;
 }
 
+static bool ggml_cuda_buffer_visible_to_backend(ggml_backend_cuda_context * cuda_ctx, ggml_backend_buffer_type_t buft, bool integrated) {
+    return buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
+           ggml_backend_buft_is_cuda_split(buft) ||
+           (integrated && ggml_backend_buft_is_cuda_host(buft));
+}
+
 //static bool ggml_backend_buffer_is_cuda_host(ggml_backend_buffer_t buffer) {
 //    return buffer->buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
 //}
@@ -1644,6 +1497,12 @@ static void ggml_cuda_op_mul_mat_cublas(
     // the main device has a larger memory buffer to hold the results from all GPUs
     // ldc == nrows of the matrix that cuBLAS writes into
     int64_t ldc = id == ctx.device ? ne0 : row_diff;
+
+    // Speculative verification can create empty sub-matrices; cuBLAS rejects
+    // zero-size GEMMs even though they are no-op work.
+    if (row_diff == 0 || src1_ncols == 0 || ne10 == 0 || ne00 == 0 || ldc == 0) {
+        return;
+    }
 
     const int cc = ggml_cuda_info().devices[id].cc;
 
@@ -2597,11 +2456,6 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     bool use_batched_cublas_bf16 = src0->type == GGML_TYPE_BF16 && bf16_mma_hardware_available(cc);
     bool use_batched_cublas_f32  = src0->type == GGML_TYPE_F32;
 
-    const int32_t hint = ggml_get_op_params_i32(dst, 1);
-    if (hint == GGML_HINT_SRC0_IS_HADAMARD && !split && ggml_cuda_op_fwht(ctx, src1, dst)) {
-        return;
-    }
-
     if (!split && use_mul_mat_vec_f) {
         // the custom F16 vector kernel can be used over batched cuBLAS GEMM
         // but this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
@@ -3094,6 +2948,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_GATED_DELTA_NET:
             ggml_cuda_op_gated_delta_net(ctx, dst);
             break;
+        case GGML_OP_GATED_DELTA_NET_TREE:
+            ggml_cuda_op_gated_delta_net_tree(ctx, dst);
+            break;
+        case GGML_OP_SSM_CONV_TREE:
+            ggml_cuda_op_ssm_conv_tree(ctx, dst);
+            break;
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);
             break;
@@ -3108,6 +2968,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_SOLVE_TRI:
             ggml_cuda_op_solve_tri(ctx, dst);
+            break;
+        case GGML_OP_TURBO_WHT:
+            ggml_cuda_op_turbo_wht(ctx, dst);
             break;
         case GGML_OP_FILL:
             ggml_cuda_op_fill(ctx, dst);
@@ -3142,11 +3005,20 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
     delete backend;
 }
 
+static bool ggml_backend_cuda_buffer_matches_backend(ggml_backend_cuda_context * cuda_ctx, ggml_backend_buffer_t buf) {
+    return buf != nullptr && buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device);
+}
+
 static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+    if (!ggml_backend_cuda_buffer_matches_backend(cuda_ctx, buf)) {
+        GGML_LOG_DEBUG("%s: tensor buffer does not match backend device %d; using owning buffer\n",
+                __func__, cuda_ctx->device);
+        ggml_backend_tensor_set(tensor, data, offset, size);
+        return;
+    }
 
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
@@ -3155,7 +3027,12 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+    if (!ggml_backend_cuda_buffer_matches_backend(cuda_ctx, buf)) {
+        GGML_LOG_DEBUG("%s: tensor buffer does not match backend device %d; using owning buffer\n",
+                __func__, cuda_ctx->device);
+        ggml_backend_tensor_get(tensor, data, offset, size);
+        return;
+    }
 
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
@@ -3165,7 +3042,12 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+    if (!ggml_backend_cuda_buffer_matches_backend(cuda_ctx, buf)) {
+        GGML_LOG_DEBUG("%s: tensor buffer does not match backend device %d; using owning buffer\n",
+                __func__, cuda_ctx->device);
+        ggml_backend_tensor_set_2d(tensor, data, offset, size, n_copies, stride_tensor, stride_data);
+        return;
+    }
 
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
@@ -3176,7 +3058,12 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+    if (!ggml_backend_cuda_buffer_matches_backend(cuda_ctx, buf)) {
+        GGML_LOG_DEBUG("%s: tensor buffer does not match backend device %d; using owning buffer\n",
+                __func__, cuda_ctx->device);
+        ggml_backend_tensor_get_2d(tensor, data, offset, size, n_copies, stride_tensor, stride_data);
+        return;
+    }
 
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
@@ -3245,10 +3132,93 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     GGML_UNUSED(backend);
 }
 
+static void ggml_cuda_log_nonlocal_src_buffer(
+        ggml_backend_cuda_context * cuda_ctx,
+        const ggml_tensor * node,
+        int src_index,
+        bool integrated,
+        const char * action) {
+    const ggml_tensor * src = src_index >= 0 ? node->src[src_index] : node;
+    const void * data = src ? src->data : nullptr;
+    int ptr_device = -1;
+    const char * ptr_type = "unknown";
+
+    if (data) {
+        cudaPointerAttributes attr;
+        cudaError_t err = cudaPointerGetAttributes(&attr, data);
+        if (err == cudaSuccess) {
+            ptr_device = attr.device;
+#if CUDART_VERSION >= 10000 || defined(GGML_USE_HIP)
+            switch (attr.type) {
+#else
+            switch (attr.memoryType) {
+#endif
+                case cudaMemoryTypeHost:    ptr_type = "host";    break;
+                case cudaMemoryTypeDevice:  ptr_type = "device";  break;
+                case cudaMemoryTypeManaged: ptr_type = "managed"; break;
+                default:                    ptr_type = "other";   break;
+            }
+        } else {
+            cudaGetLastError();
+        }
+    }
+
+    GGML_LOG_ERROR(
+            "%s: source buffer is not visible to CUDA backend device; action=%s backend_device=%d integrated=%d node=%s op=%s src[%d]=%s src_buft=%s dst_buft=%s src_data=%p ptr_type=%s ptr_device=%d\n",
+            __func__,
+            action ? action : "fail",
+            cuda_ctx->device,
+            integrated ? 1 : 0,
+            node ? node->name : "(null)",
+            node ? ggml_op_name(node->op) : "(null)",
+            src_index,
+            src ? src->name : "(null)",
+            src && src->buffer ? ggml_backend_buft_name(src->buffer->buft) : "(none)",
+            node && node->buffer ? ggml_backend_buft_name(node->buffer->buft) : "(none)",
+            data,
+            ptr_type,
+            ptr_device);
+}
+
+static bool ggml_cuda_graph_node_buffers_visible(
+        ggml_backend_cuda_context * cuda_ctx,
+        const ggml_tensor * node,
+        bool integrated,
+        bool log_errors) {
+    if (!node || ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
+            node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE ||
+            (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        return true;
+    }
+
+    if (!node->buffer || node->buffer->buft != ggml_backend_cuda_buffer_type(cuda_ctx->device)) {
+        if (log_errors) {
+            ggml_cuda_log_nonlocal_src_buffer(cuda_ctx, node, -1, integrated, "fail graph compute");
+        }
+        return false;
+    }
+
+    for (int j = 0; j < GGML_MAX_SRC; ++j) {
+        const ggml_tensor * src = node->src[j];
+        if (!src) {
+            continue;
+        }
+        if (!src->buffer || !ggml_cuda_buffer_visible_to_backend(cuda_ctx, src->buffer->buft, integrated)) {
+            if (log_errors) {
+                ggml_cuda_log_nonlocal_src_buffer(cuda_ctx, node, j, integrated, "fail graph compute");
+            }
+            return false;
+        }
+    }
+
+    return true;
+}
+
 #ifdef USE_CUDA_GRAPH
-static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+static bool ggml_cuda_graph_check_compability(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
+    const bool integrated = ggml_cuda_info().devices[cuda_ctx->device].integrated;
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -3258,11 +3228,32 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             continue;
         }
 
-        if (node->src[0] && node->src[0]->buffer && ggml_backend_buft_is_cuda_split(node->src[0]->buffer->buft)) {
-            use_cuda_graph = false; // Split buffers are not supported by CUDA graph capture
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            const ggml_tensor * src = node->src[j];
+            if (!src || !src->buffer) {
+                continue;
+            }
+            const ggml_backend_buffer_type_t src_buft = src->buffer->buft;
+            if (ggml_backend_buft_is_cuda_split(src_buft)) {
+                use_cuda_graph = false; // Split buffers are not supported by CUDA graph capture
 #ifndef NDEBUG
-            GGML_LOG_DEBUG("%s: disabling CUDA graphs due to split buffer\n", __func__);
+                GGML_LOG_DEBUG("%s: disabling CUDA graphs due to split source buffer on node %s src[%d]\n",
+                        __func__, node->name, j);
 #endif
+                break;
+            }
+
+            if (!ggml_cuda_buffer_visible_to_backend(cuda_ctx, src_buft, integrated)) {
+                use_cuda_graph = false;
+#ifndef NDEBUG
+                GGML_LOG_DEBUG("%s: disabling CUDA graphs due to non-local source buffer on CUDA%d node %s src[%d] (%s)\n",
+                        __func__, cuda_ctx->device, node->name, j, ggml_backend_buft_name(src_buft));
+#endif
+                break;
+            }
+        }
+        if (!use_cuda_graph) {
+            break;
         }
 
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
@@ -3278,6 +3269,20 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
 #endif
             }
+        }
+
+        if (node->op == GGML_OP_SSM_CONV_TREE || node->op == GGML_OP_GATED_DELTA_NET_TREE) {
+            use_cuda_graph = false;
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: disabling CUDA graphs due to tree verify op\n", __func__);
+#endif
+        }
+
+        if (strncmp(node->name, "dflash_kv_update", 16) == 0) {
+            use_cuda_graph = false;
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: disabling CUDA graphs for DFlash K/V update graph\n", __func__);
+#endif
         }
 
         if (!use_cuda_graph) {
@@ -3306,6 +3311,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     }
 
     graph->uid = cgraph->uid;
+
 
     // Check if the graph size has changed
     if ((int)graph->node_props.size() != cgraph->n_nodes) {
@@ -3565,8 +3571,9 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
     };
 
     bool is_ok = true;
-    // exception for topk-moe, as each row is read entirely before writing
-    if (ggml_nrows(cgraph->nodes[node_idx]) == 1 && is_topk_moe) {
+    // for nrows=1, all fusion operations correctly read the src
+    // before writing dst or do it elementwise, so we should be ok
+    if (ggml_nrows(cgraph->nodes[node_idx]) == 1) {
         return true;
     }
 
@@ -3679,10 +3686,12 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
             add = cgraph->nodes[node_idx+2];
         }
 
-        GGML_ASSERT(rms_norm->src[0]->type == GGML_TYPE_F32);
-        GGML_ASSERT(rms_norm->type == GGML_TYPE_F32);
+        // fused rms_norm+mul only supports F32
+        if (rms_norm->src[0]->type != GGML_TYPE_F32 ||
+            rms_norm->type != GGML_TYPE_F32) {
+            return false;
+        }
 
-        //rms norm only supports F32
         if (mul->src[0]->type != GGML_TYPE_F32 ||
             mul->src[1]->type != GGML_TYPE_F32 ||
             mul->type != GGML_TYPE_F32) {
@@ -3915,50 +3924,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
         ggml_cuda_op_rope_fused(*cuda_ctx, rope, set_rows);
         return 2;
-    }
-
-    // Snake activation: y = x + sin(a*x)^2 * inv_b
-    // Naive 5-op decomposition emitted by frontends: mul -> sin -> sqr -> mul -> add
-    if (ggml_can_fuse_subgraph(cgraph, i,
-            { GGML_OP_MUL, GGML_OP_SIN, GGML_OP_SQR, GGML_OP_MUL, GGML_OP_ADD },
-            { i + 4 })) {
-        const ggml_tensor * mul0 = cgraph->nodes[i];
-        const ggml_tensor * sqr  = cgraph->nodes[i + 2];
-        const ggml_tensor * mul1 = cgraph->nodes[i + 3];
-        ggml_tensor *       add  = cgraph->nodes[i + 4];
-
-        // x carries the full activation shape, a is the broadcast operand
-        const ggml_tensor * x = ggml_are_same_shape(mul0, mul0->src[0]) ? mul0->src[0] : mul0->src[1];
-        const ggml_tensor * a = (x == mul0->src[0]) ? mul0->src[1] : mul0->src[0];
-
-        // mul1 reads sqr and inv_b in either operand order
-        const ggml_tensor * inv_b = (mul1->src[0] == sqr) ? mul1->src[1] : mul1->src[0];
-
-        // closure check: the trailing add must read the same x as the leading mul
-        const ggml_tensor * x_in_add = (add->src[0] == mul1) ? add->src[1] : add->src[0];
-
-        // Kernel iterates over total = T * C, so x and add must be 2D and
-        // a / inv_b must collapse to [1, C, 1, 1]. Higher dims are not handled.
-        const bool dim_ok   = (x->ne[2]   == 1 && x->ne[3]   == 1) &&
-                              (add->ne[2] == 1 && add->ne[3] == 1) &&
-                              (a->ne[2]   == 1 && a->ne[3]   == 1);
-        const bool shape_ok = ggml_are_same_shape(a, inv_b) && a->ne[0] == 1 && a->ne[1] == x->ne[1];
-
-        // x must be in the supported whitelist and every operand / intermediate
-        // result must share x's type, since launch_snake casts a / inv_b as
-        // float and templates the kernel on a single T. Mixed precision chains
-        // fall back to the naive path.
-        const ggml_tensor * sin1 = cgraph->nodes[i + 1];
-        const bool types_ok = (x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_F16 || x->type == GGML_TYPE_BF16) &&
-                              (a->type    == x->type) && (inv_b->type == x->type) &&
-                              (mul0->type == x->type) && (sin1->type  == x->type) &&
-                              (sqr->type  == x->type) && (mul1->type  == x->type) &&
-                              (add->type  == x->type);
-
-        if (types_ok && shape_ok && dim_ok && x_in_add == x) {
-            ggml_cuda_op_snake_fused(*cuda_ctx, x, a, inv_b, add);
-            return 4;
-        }
     }
 
     // multi-(add or mul)
@@ -4228,7 +4193,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
-static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+
+static enum ggml_status ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu
@@ -4380,24 +4346,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     i += nodes_to_skip;
                     continue;
                 }
-#ifndef NDEBUG
-                assert(node->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device));
-                for (int j = 0; j < GGML_MAX_SRC; j++) {
-                    if (node->src[j] != nullptr) {
-                        assert(node->src[j]->buffer);
-                        assert(node->src[j]->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
-                               ggml_backend_buft_is_cuda_split(node->src[j]->buffer->buft) || (integrated && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)));
-                    }
+                if (!ggml_cuda_graph_node_buffers_visible(cuda_ctx, node, integrated, true)) {
+                    return GGML_STATUS_FAILED;
                 }
-#else
-                GGML_UNUSED(integrated);
-#endif  // NDEBUG
 
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+                    return GGML_STATUS_FAILED;
                 }
-                GGML_ASSERT(ok);
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
@@ -4440,6 +4397,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         graph_evaluated_or_captured = true;
 #endif  // USE_CUDA_GRAPH
     }
+
+    return GGML_STATUS_SUCCESS;
 }
 
 #ifdef USE_CUDA_GRAPH
@@ -4475,7 +4434,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     if (graph->is_enabled()) {
-        const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+        const bool graph_compatible = ggml_cuda_graph_check_compability(cuda_ctx, cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
@@ -4503,6 +4462,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif // USE_CUDA_GRAPH
 
+    const bool integrated = ggml_cuda_info().devices[cuda_ctx->device].integrated;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        if (!ggml_cuda_graph_node_buffers_visible(cuda_ctx, cgraph->nodes[i], integrated, true)) {
+            return GGML_STATUS_FAILED;
+        }
+    }
+
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
@@ -4513,7 +4479,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
-    ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    const ggml_status status = ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    if (status != GGML_STATUS_SUCCESS) {
+        return status;
+    }
 
     return GGML_STATUS_SUCCESS;
 }
@@ -4521,6 +4490,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 static void ggml_backend_cuda_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
+    ggml_cuda_set_device(cuda_ctx->device);
     CUDA_CHECK(cudaEventRecord((cudaEvent_t)event->context, cuda_ctx->stream()));
 }
 
@@ -4528,6 +4498,10 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     if (ggml_backend_is_cuda(backend)) {
+        // ROCm requires current device to match the stream's device for hipStreamWaitEvent.
+        // In pipeline-parallel multi-GPU, the scheduler alternates between devices and may
+        // call event_wait with a stale current device from the previous split.
+        ggml_cuda_set_device(cuda_ctx->device);
         CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), (cudaEvent_t)event->context, 0));
     } else {
 #if 0
@@ -4813,6 +4787,61 @@ static ggml_guid_t ggml_backend_cuda_guid() {
 
 bool ggml_backend_is_cuda(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cuda_guid());
+}
+
+extern "C" bool dflash_cuda_backend_wait_for_stream(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+
+    static thread_local cudaEvent_t dflash_wait_events[GGML_CUDA_MAX_DEVICES] = {};
+    cudaEvent_t & event = dflash_wait_events[cuda_ctx->device];
+    if (event == nullptr) {
+        cudaError_t err = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+        if (err != cudaSuccess) {
+            event = nullptr;
+            return false;
+        }
+    }
+
+    cudaError_t err = cudaEventRecord(event, cuda_ctx->stream());
+    if (err == cudaSuccess) {
+        err = cudaStreamWaitEvent(cudaStreamPerThread, event, 0);
+    }
+
+    return err == cudaSuccess;
+}
+
+extern "C" bool dflash_cuda_backend_wait_for_dflash_stream(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+
+    static thread_local cudaEvent_t dflash_backend_wait_events[GGML_CUDA_MAX_DEVICES] = {};
+    cudaEvent_t & event = dflash_backend_wait_events[cuda_ctx->device];
+    if (event == nullptr) {
+        cudaError_t err = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+        if (err != cudaSuccess) {
+            event = nullptr;
+            return cudaStreamSynchronize(cudaStreamPerThread) == cudaSuccess;
+        }
+    }
+
+    cudaError_t err = cudaEventRecord(event, cudaStreamPerThread);
+    if (err == cudaSuccess) {
+        err = cudaStreamWaitEvent(cuda_ctx->stream(), event, 0);
+    }
+    if (err != cudaSuccess) {
+        return cudaStreamSynchronize(cudaStreamPerThread) == cudaSuccess;
+    }
+
+    return true;
 }
 
 int ggml_backend_cuda_get_device_count() {
@@ -5194,6 +5223,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
+                    case GGML_TYPE_TURBO2_0:
+                    case GGML_TYPE_TURBO3_0:
+                    case GGML_TYPE_TURBO4_0:
+                    case GGML_TYPE_TURBO3_TCQ:
+                    case GGML_TYPE_TURBO2_TCQ:
                         return true;
                     default:
                         return false;
@@ -5207,7 +5241,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             {
                 return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
                        op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
-                       op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL) &&
+                       op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL ||
+                       op->type == GGML_TYPE_TURBO2_0 || op->type == GGML_TYPE_TURBO3_0 || op->type == GGML_TYPE_TURBO4_0 ||
+                       op->type == GGML_TYPE_TURBO3_TCQ ||
+                       op->type == GGML_TYPE_TURBO2_TCQ) &&
                        op->src[0]->type == GGML_TYPE_F32 &&
                        (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
             } break;
@@ -5320,8 +5357,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_VIEW:
         case GGML_OP_PERMUTE:
         case GGML_OP_TRANSPOSE:
+        case GGML_OP_ADD:
         case GGML_OP_ADD_ID:
         case GGML_OP_ADD1:
+        case GGML_OP_SUB:
+        case GGML_OP_MUL:
+        case GGML_OP_DIV:
         case GGML_OP_SCALE:
         case GGML_OP_SQR:
         case GGML_OP_SQRT:
@@ -5330,13 +5371,6 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_CLAMP:
         case GGML_OP_LOG:
             return true;
-        case GGML_OP_ADD:
-        case GGML_OP_SUB:
-        case GGML_OP_MUL:
-        case GGML_OP_DIV:
-            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
-                   (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) &&
-                   (op->type         == GGML_TYPE_F32 || op->type         == GGML_TYPE_F16);
         case GGML_OP_SSM_SCAN: {
             if (op->src[3]->ne[0] == 1) {
                 // Mamba2
@@ -5350,6 +5384,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         }
         case GGML_OP_SSM_CONV: {
             // assumes d_inner % threads == 0
+            return op->src[0]->ne[1] % 128 == 0;
+        }
+        case GGML_OP_SSM_CONV_TREE: {
             return op->src[0]->ne[1] % 128 == 0;
         }
         case GGML_OP_CONT:
@@ -5425,6 +5462,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_TRI:
         case GGML_OP_DIAG:
         case GGML_OP_SOLVE_TRI:
+        case GGML_OP_TURBO_WHT:
             return true;
 
         default:
@@ -5468,7 +5506,7 @@ static ggml_backend_event_t ggml_backend_cuda_device_event_new(ggml_backend_dev_
     ggml_cuda_set_device(dev_ctx->device);
 
     cudaEvent_t event;
-    CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreate(&event));
 
     return new ggml_backend_event {
         /* .device  = */ dev,
@@ -5590,6 +5628,32 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// DFlash GPU cross-attention ring (cross-ring-interleave.cu)
+extern "C" void * dflash_cross_ring_gpu_alloc(int, int, int);
+extern "C" void   dflash_cross_ring_gpu_free(void *);
+extern "C" void   dflash_cross_ring_gpu_write(void *, int, int, const float *, int, int);
+extern "C" bool   dflash_cross_ring_gpu_write_d2d(void *, int, int, const void *, int, int);
+extern "C" bool   dflash_rebuild_conv_state(void *, const void *, int, int, int);
+extern "C" bool   dflash_cuda_copy_d2d(void *, const void *, size_t);
+extern "C" bool   dflash_cuda_prepare_ptr(const void *);
+extern "C" bool   dflash_cuda_copy_d2d_no_check(void *, const void *, size_t);
+extern "C" bool   dflash_cuda_set_device(int);
+extern "C" bool   dflash_cuda_synchronize_ptr(const void *);
+extern "C" bool   dflash_cuda_ptr_device(const void *, int *);
+extern "C" bool   dflash_cuda_synchronize_device(int);
+extern "C" bool   dflash_cuda_backend_wait_for_stream(ggml_backend_t);
+extern "C" bool   dflash_cuda_backend_wait_for_dflash_stream(ggml_backend_t);
+extern "C" bool dflash_replay_gdn_state_no_check(void *, const void *, const void *, const void *, const void *, int, int, int, int);
+extern "C" void   dflash_cross_ring_gpu_synchronize(void *);
+extern "C" bool   dflash_cross_ring_gpu_snapshot(void *, int, int, int, float *, int, int, int);
+extern "C" const float * dflash_cross_ring_gpu_interleave(void *, int, int, int);
+extern "C" void   dflash_cross_ring_gpu_set_tensor(void *, const void *, size_t, size_t);
+extern "C" bool   dflash_kv_cache_write_d2d(void *, const void *, int, int, int, int);
+extern "C" bool   dflash_kv_cache_write_d2d_no_check(void *, const void *, int, int, int, int);
+extern "C" bool   dflash_kv_cache_append_d2d(void *, const void *, int, int, int, int);
+extern "C" bool   dflash_kv_cache_append_d2d_no_check(void *, const void *, int, int, int, int);
+extern "C" bool   dflash_kv_cache_interleave(const void *, void *, int, int, int, int, int);
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -5612,6 +5676,78 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "dflash_cross_ring_gpu_alloc") == 0) {
+        return (void *)dflash_cross_ring_gpu_alloc;
+    }
+    if (strcmp(name, "dflash_cross_ring_gpu_free") == 0) {
+        return (void *)dflash_cross_ring_gpu_free;
+    }
+    if (strcmp(name, "dflash_cross_ring_gpu_write") == 0) {
+        return (void *)dflash_cross_ring_gpu_write;
+    }
+    if (strcmp(name, "dflash_cross_ring_gpu_write_d2d") == 0) {
+        return (void *)dflash_cross_ring_gpu_write_d2d;
+    }
+    if (strcmp(name, "dflash_rebuild_conv_state") == 0) {
+        return (void *)dflash_rebuild_conv_state;
+    }
+    if (strcmp(name, "dflash_cuda_copy_d2d") == 0) {
+        return (void *)dflash_cuda_copy_d2d;
+    }
+    if (strcmp(name, "dflash_cuda_prepare_ptr") == 0) {
+        return (void *)dflash_cuda_prepare_ptr;
+    }
+    if (strcmp(name, "dflash_cuda_copy_d2d_no_check") == 0) {
+        return (void *)dflash_cuda_copy_d2d_no_check;
+    }
+    if (strcmp(name, "dflash_cuda_set_device") == 0) {
+        return (void *)dflash_cuda_set_device;
+    }
+    if (strcmp(name, "dflash_cuda_synchronize_ptr") == 0) {
+        return (void *)dflash_cuda_synchronize_ptr;
+    }
+    if (strcmp(name, "dflash_cuda_ptr_device") == 0) {
+        return (void *)dflash_cuda_ptr_device;
+    }
+    if (strcmp(name, "dflash_cuda_synchronize_device") == 0) {
+        return (void *)dflash_cuda_synchronize_device;
+    }
+    if (strcmp(name, "dflash_cuda_backend_wait_for_stream") == 0) {
+        return (void *)dflash_cuda_backend_wait_for_stream;
+    }
+    if (strcmp(name, "dflash_cuda_backend_wait_for_dflash_stream") == 0) {
+        return (void *)dflash_cuda_backend_wait_for_dflash_stream;
+    }
+    if (strcmp(name, "dflash_replay_gdn_state_no_check") == 0) {
+        return (void *)dflash_replay_gdn_state_no_check;
+    }
+    if (strcmp(name, "dflash_cross_ring_gpu_synchronize") == 0) {
+        return (void *)dflash_cross_ring_gpu_synchronize;
+    }
+    if (strcmp(name, "dflash_cross_ring_gpu_snapshot") == 0) {
+        return (void *)dflash_cross_ring_gpu_snapshot;
+    }
+    if (strcmp(name, "dflash_cross_ring_gpu_interleave") == 0) {
+        return (void *)dflash_cross_ring_gpu_interleave;
+    }
+    if (strcmp(name, "dflash_cross_ring_gpu_set_tensor") == 0) {
+        return (void *)dflash_cross_ring_gpu_set_tensor;
+    }
+    if (strcmp(name, "dflash_kv_cache_write_d2d") == 0) {
+        return (void *)dflash_kv_cache_write_d2d;
+    }
+    if (strcmp(name, "dflash_kv_cache_write_d2d_no_check") == 0) {
+        return (void *)dflash_kv_cache_write_d2d_no_check;
+    }
+    if (strcmp(name, "dflash_kv_cache_append_d2d") == 0) {
+        return (void *)dflash_kv_cache_append_d2d;
+    }
+    if (strcmp(name, "dflash_kv_cache_append_d2d_no_check") == 0) {
+        return (void *)dflash_kv_cache_append_d2d_no_check;
+    }
+    if (strcmp(name, "dflash_kv_cache_interleave") == 0) {
+        return (void *)dflash_kv_cache_interleave;
     }
     return nullptr;
 }
@@ -5644,12 +5780,9 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
                 CUDA_CHECK(cudaGetDeviceProperties(&prop, i));
                 dev_ctx->description = prop.name;
 
-                char pci_bus_id[32] = {};
-                CUDA_CHECK(cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), i));
+                char pci_bus_id[16] = {};
+                snprintf(pci_bus_id, sizeof(pci_bus_id), "%04x:%02x:%02x.0", prop.pciDomainID, prop.pciBusID, prop.pciDeviceID);
                 dev_ctx->pci_bus_id = pci_bus_id;
-                for (char & c : dev_ctx->pci_bus_id) {
-                    c = std::tolower(c);
-                }
                 dev_ctx->op_offload_min_batch_size = min_batch_size;
 
                 ggml_backend_dev_t dev = new ggml_backend_device {

@@ -9,6 +9,7 @@
 #include "ngram-map.h"
 #include "ngram-mod.h"
 #include "sampling.h"
+#include "suffix-tree.h"
 
 #include <algorithm>
 #include <cassert>
@@ -29,7 +30,11 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"ngram-map-k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram-map-k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
     {"ngram-mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
-    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
+    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE},
+    {"suffix",        COMMON_SPECULATIVE_TYPE_SUFFIX},
+    {"copyspec",      COMMON_SPECULATIVE_TYPE_COPYSPEC},
+    {"recycle",       COMMON_SPECULATIVE_TYPE_RECYCLE},
+    {"dflash",        COMMON_SPECULATIVE_TYPE_DFLASH}
 };
 
 static std::string common_speculative_get_devices_str(const std::vector<ggml_backend_dev_t> & devices) {
@@ -164,6 +169,9 @@ struct common_speculative_impl {
     // true if this implementation requires the target context to extract pre-norm embeddings
     virtual bool need_embd_pre_norm() const { return false; }
 };
+
+// CopySpec / Suffix / Recycle implementations (defined in separate file for clarity)
+#include "speculative-copyspec.cpp"
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
     common_params_speculative_draft params;
@@ -1278,6 +1286,10 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram-map-k4v";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram-mod";
         case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram-cache";
+        case COMMON_SPECULATIVE_TYPE_SUFFIX:        return "suffix";
+        case COMMON_SPECULATIVE_TYPE_COPYSPEC:      return "copyspec";
+        case COMMON_SPECULATIVE_TYPE_RECYCLE:        return "recycle";
+        case COMMON_SPECULATIVE_TYPE_DFLASH:        return "dflash";
         default:                                    return "unknown";
     }
 }
@@ -1337,8 +1349,13 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         bool has_ngram_map_k4v = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V));
         bool has_ngram_mod     = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_MOD));
 
+        bool has_suffix        = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_SUFFIX));
+        bool has_copyspec      = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_COPYSPEC));
+        bool has_recycle       = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_RECYCLE));
+        bool has_dflash        = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DFLASH));
+
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 9);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 13);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
@@ -1358,6 +1375,18 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         }
         if (has_ngram_cache) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_NGRAM_CACHE, params));
+        }
+        if (has_suffix) {
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_SUFFIX, params));
+        }
+        if (has_copyspec) {
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_COPYSPEC, params));
+        }
+        if (has_recycle) {
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_RECYCLE, params));
+        }
+        if (has_dflash) {
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DFLASH, params));
         }
         if (has_draft_simple) {
             if (!has_draft_model_path) {
@@ -1439,6 +1468,34 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                         params.ngram_cache.lookup_cache_static,
                         params.ngram_cache.lookup_cache_dynamic);
                 impls.push_back(std::make_unique<common_speculative_impl_ngram_cache>(state));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_DFLASH: {
+                // TODO: implement common_speculative_impl_dflash
+                // Source: beellama.cpp/common/speculative.cpp lines 1653-3263
+                LOG_WRN("%s: DFlash speculative type is not yet implemented\n", __func__);
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_SUFFIX: {
+                impls.push_back(std::make_unique<common_speculative_impl_suffix>(
+                    config.type, n_seq,
+                    config.params.suffix_max_depth,
+                    config.params.draft.n_max,
+                    config.params.suffix_spec_factor,
+                    config.params.suffix_spec_offset,
+                    config.params.suffix_min_prob));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_COPYSPEC: {
+                impls.push_back(std::make_unique<common_speculative_impl_copyspec>(
+                    config.type, n_seq,
+                    config.params.copyspec_gamma));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_RECYCLE: {
+                impls.push_back(std::make_unique<common_speculative_impl_recycle>(
+                    config.type, n_seq,
+                    config.params.recycle_k));
                 break;
             }
             default:
