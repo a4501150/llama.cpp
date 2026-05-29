@@ -143,8 +143,21 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
 static void common_reasoning_budget_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
     auto * ctx = (common_reasoning_budget_ctx *) smpl->ctx;
 
+    if (ctx->state == REASONING_BUDGET_COUNTING || ctx->state == REASONING_BUDGET_WAITING_UTF8) {
+        if (ctx->vocab) {
+            const llama_token eos = llama_vocab_eos(ctx->vocab);
+            if (eos != LLAMA_TOKEN_NULL) {
+                for (size_t i = 0; i < cur_p->size; i++) {
+                    if (cur_p->data[i].id == eos) {
+                        cur_p->data[i].logit = -INFINITY;
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     if (ctx->state != REASONING_BUDGET_FORCING) {
-        // passthrough — don't modify logits
         return;
     }
 

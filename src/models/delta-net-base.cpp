@@ -588,7 +588,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
     for (int64_t k_i = 0; k_i < K; ++k_i) {
-        const uint32_t cache_slot = (uint32_t) (K - 1 - k_i);
+        const uint32_t cache_slot = (uint32_t) k_i;
         ggml_tensor * src = ggml_view_4d(ctx0, gdn_out,
             S_v, S_v, H_v, n_seqs,
             ggml_row_size(gdn_out->type, S_v),
